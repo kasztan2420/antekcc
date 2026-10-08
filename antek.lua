@@ -588,14 +588,17 @@ function A.gameFocused()
 end
 
 -- stan Ctrl(1) / Shift(2) / Alt(4)
-function A.modState()
+local function modBits()
     local m = 0
-    pcall(function()
-        if ffi.C.GetAsyncKeyState(0x11) < 0 then m = m + 1 end
-        if ffi.C.GetAsyncKeyState(0x10) < 0 then m = m + 2 end
-        if ffi.C.GetAsyncKeyState(0x12) < 0 then m = m + 4 end
-    end)
+    if ffi.C.GetAsyncKeyState(0x11) < 0 then m = m + 1 end
+    if ffi.C.GetAsyncKeyState(0x10) < 0 then m = m + 2 end
+    if ffi.C.GetAsyncKeyState(0x12) < 0 then m = m + 4 end
     return m
+end
+
+function A.modState()
+    local ok, m = pcall(modBits)
+    return ok and m or 0
 end
 
 function A.comboHit(vk, mods, wparam)
