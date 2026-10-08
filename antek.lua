@@ -11675,7 +11675,7 @@ local on, down, paused = false, false, false
 local nextFlip, flipFrame, frameNo = 0, -1, 0
 local scan, ext, synVk = 0x15, 0, 0x59           -- scancode, flaga EXTENDEDKEY, VK w WM_KEYDOWN
 local SYN = { vk = 0x59, untilT = 0 }            -- A.synth: wlasne wcisniecia nie sa skrotami innych modulow
-local kbd, fgWin, winPid, myPid, pidBuf          -- WinAPI rozwiazane raz (bez closure / ffi.new co klatke)
+local kbd                                        -- keybd_event rozwiazane raz (bez closure co wcisniecie)
 local font, hudW
 
 -- lewy/prawy Shift, Ctrl, Alt przychodza w WM_KEYDOWN jako zwykly Shift, Ctrl, Alt
@@ -11711,15 +11711,6 @@ local function release()
     end
 end
 
--- okno na pierwszym planie nalezy do procesu gry
-local function gameFocused()
-    if not pidBuf then return A.gameFocused() end
-    local h = fgWin()
-    if h == nil then return false end
-    winPid(h, pidBuf)
-    return pidBuf[0] == myPid
-end
-
 local function set(v)
     on = v and true or false
     if not on then release() end
@@ -11738,13 +11729,6 @@ function M.init()
     save()
     local okK, fk = pcall(function() return ffi.C.keybd_event end)
     kbd = okK and fk or nil
-    local okF, fw, fp, me, buf = pcall(function()
-        local fwin, fpid, b = ffi.C.GetForegroundWindow, ffi.C.GetWindowThreadProcessId, ffi.new('uint32_t[1]')
-        local h = fwin()
-        if h ~= nil then fpid(h, b) end                  -- proba: typy argumentow pasuja (inaczej A.gameFocused)
-        return fwin, fpid, ffi.C.GetCurrentProcessId(), b
-    end)
-    if okF then fgWin, winPid, myPid, pidBuf = fw, fp, me, buf end
     updScan()
     font = renderCreateFont('Arial', 9, 5)
 end
@@ -11758,8 +11742,8 @@ end
 function M.frame(now)
     frameNo = frameNo + 1
     if on then
-        -- fokus co klatke (dwa tanie wywolania WinAPI): po alt-tabie (BackgroundPlay) zadne wcisniecie nie trafi do innego okna
-        paused = A.menuOpen or A.miningBusy or A.minerAuto or A.zoneBotOn or not gameFocused() or A.pauseActive()
+        -- fokus co klatke (A.gameFocused bez alokacji): po alt-tabie (BackgroundPlay) zadne wcisniecie nie trafi do innego okna
+        paused = A.menuOpen or A.miningBusy or A.minerAuto or A.zoneBotOn or not A.gameFocused() or A.pauseActive()
             or A.chatInputActive() or A.dialogActive()
         if paused then
             release()
