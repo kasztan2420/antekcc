@@ -1,5 +1,15 @@
 # Zmiany
 
+## 2.2.0
+
+- Nowa zakładka **Narzędzia**:
+  - wykrywacz TNT: HUD (odległość, kierunek, ile w zasięgu), napisy 3D, radar, alarm o nowym TNT do 60 m;
+    model TNT uczony jednym kliknięciem z celownika albo z listy obiektów w pobliżu,
+  - celownik: model i odległość obiektu na środku ekranu, `Delete` ukrywa obiekt (niewidoczny, bez kolizji,
+    tylko u Ciebie; po ponownym wczytaniu ukrywa się znowu), opcja „ukryj cały model”, przywracanie w menu,
+  - wsiadanie do pojazdów RC (Goblin, Bandit, Baron, Raider, Tiger, Cam) klawiszem `F`.
+- SAMPGPT: bez statusu klucza Gemini i `curl.exe` w menu.
+
 ## 2.1.0
 
 ### Strefy Bot — jazda

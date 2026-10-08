@@ -16,7 +16,8 @@ end
 -- ------------------------------------------------------------ ladowanie
 t('skrypt sie laduje i rejestruje moduly', function()
     assert(type(A) == 'table', 'brak A')
-    for _, id in ipairs({ 'tracker', 'graffiti', 'strefy', 'pool', 'gpt', 'autoy', 'karta', 'gornik', 'statuetki', 'walizki', 'boty', 'settings' }) do
+    for _, id in ipairs({ 'tracker', 'graffiti', 'strefy', 'pool', 'gpt', 'autoy', 'karta', 'gornik', 'statuetki', 'walizki', 'tools',
+        'boty', 'settings' }) do
         assert(A.mods[id], 'brak modulu ' .. id)
     end
 end)
@@ -221,6 +222,63 @@ t('menu: render i klikniecia wszystkich zakladek', function()
         if l:find('menu:', 1, true) then errs[#errs + 1] = l end
     end
     assert(#errs == 0, '\n  ' .. table.concat(errs, '\n  '))
+end)
+
+-- Narzedzia: TNT, ukrywanie obiektow, celownik, RC (swiat z atrap)
+t('narzedzia: TNT, ukrywanie, celownik, RC', function()
+    local T = A.mods.tools.test
+    local E = H.env
+    local world = {                    -- uchwyt -> { model, x, y, z }
+        [1] = { 1271, 110, 200, 10 }, [2] = { 1271, 150, 200, 10 }, [3] = { 3000, 101, 200, 10 },
+    }
+    local shown = {}                   -- uchwyt -> false po ukryciu
+    E.getAllObjects = function() local l = {} for h in pairs(world) do l[#l + 1] = h end return l end
+    E.doesObjectExist = function(h) return world[h] ~= nil end
+    E.getObjectModel = function(h) return world[h][1] end
+    E.getObjectCoordinates = function(h) local o = world[h]; return true, o[2], o[3], o[4] end
+    E.getObjectPointer = function(h) return 1000 + h end
+    E.setObjectVisible = function(h, v) shown[h] = v end
+    E.setObjectCollision = function() end
+
+    T.setTnt(1271, true)
+    T.scan(100, 200, 10)
+    eq(#T.tnts(), 2, 'TNT w zasiegu')
+    eq(T.tnts()[1].x, 110, 'najblizsze pierwsze')
+    eq(T.objs()[1].m, 3000, 'lista obiektow od najblizszego')
+
+    -- celownik: promien z kamery trafia w obiekt o wskazniku 1003
+    E.processLineOfSight = function() return true, { pos = { 101, 200, 10 }, normal = { -1, 0, 0 }, entity = 1003 } end
+    T.aimUpdate()
+    assert(T.aim() and T.aim().h == 3, 'celownik nie znalazl obiektu')
+
+    T.hideOne(T.aim())
+    eq(shown[3], false, 'obiekt nie ukryty')
+    eq(#T.C.hidden, 1)
+    -- serwer wczytuje obiekt ponownie (nowy uchwyt, ta sama pozycja): ukrywa sie sam
+    world[3], world[7] = nil, { 3000, 101, 200, 10 }
+    T.scan(100, 200, 10)
+    eq(shown[7], false, 'po streamie obiekt nie ukryl sie znowu')
+    T.restoreAll()
+    eq(shown[7], true, 'przywracanie')
+    eq(#T.C.hidden, 0)
+
+    -- RC: wolny RC Goblin 3 m obok -> wsiada; zwykle auto blizej -> nie
+    local cars = { [10] = { 501, 103, 200, 10 }, [11] = { 400, 110, 200, 10 } }
+    local warped
+    E.isCharInAnyCar = function() return false end
+    E.getAllVehicles = function() local l = {} for h in pairs(cars) do l[#l + 1] = h end return l end
+    E.doesVehicleExist = function(v) return cars[v] ~= nil end
+    E.getCarCoordinates = function(v) local c = cars[v]; return c[2], c[3], c[4] end
+    E.getCarModel = function(v) return cars[v][1] end
+    E.getDriverOfCar = function() return -1 end
+    E.warpCharIntoCar = function(_, v) warped = v end
+    T.rcEnter()
+    eq(warped, 10, 'nie wsiadl do RC')
+    warped = nil
+    cars[11] = { 400, 101.5, 200, 10 }
+    T.rcEnter()
+    eq(warped, nil, 'wsiadl do RC mimo blizszego zwyklego auta')
+    T.setTnt(1271, false)
 end)
 
 print(('%d ok, %d fail'):format(pass, fail))

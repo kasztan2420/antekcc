@@ -1,4 +1,4 @@
-local VERSION = '2.1.0'
+local VERSION = '2.2.0'
 
 script_name('antek.cc')
 script_author('antek')
@@ -15,7 +15,7 @@ script_properties('work-in-pause')
 --   CORE    pomocnicze, biblioteki, konfiguracja, SA-MP, FFI, watki, czat, HUD-y, moduly, nawigacja (A*)
 --   DANE    teleporty serwera, strefy gangowe
 --   MODULY  Tracker, Gang (graffiti + Strefy Bot), Strefy, Bilard, SAMPGPT, Makro, Kasyno, Gornik,
---           Statuetki, Walizki
+--           Statuetki, Walizki, Narzedzia (TNT, obiekty, RC)
 --   MENU    mimgui + helpery UI, klawisze, zakladki Boty / Ustawienia, main()
 --
 -- Modul: A.register{ id, title, hidden?, init(), frame(now), menu(), disable(), terminate(quit), status(),
@@ -426,7 +426,7 @@ A.cfg = {
     tab        = 'tracker',
     -- komplet id modulow: A.overlay przenosi z pliku tylko klucze, ktore tu istnieja
     modules    = { tracker = true, graffiti = true, strefy = true, pool = true, gpt = true, autoy = true, karta = true,
-                   gornik = true, statuetki = true, walizki = true },
+                   gornik = true, statuetki = true, walizki = true, tools = true },
     hud        = {},       -- id -> { fx, fy }
 }
 
@@ -11512,11 +11512,6 @@ local KEY_OPTS = {
 function M.menu()
     local ui = A.ui
     ui.cols(function()
-        ui.group('Status', function()
-            local key = cached_key()
-            ui.kv('Gemini', key ~= '' and 'ustawiony' or 'brak', key ~= '' and 0xFF33FF66 or 0xFFFF6666)
-            ui.kv('curl.exe', CURL_EXE and 'jest' or 'brak', CURL_EXE and 0xFF33FF66 or 0xFFFF6666)
-        end)
         ui.group('Quizy', function()
             ui.check('Quizy', function() return quiz_enabled end, function() queue_command('aiquiz', '') end,
                 'AI sam rozwiazuje quizy i rebusy z czatu oraz ramek na ekranie.')
@@ -14251,6 +14246,475 @@ return M
 end)(A))
 
 -- ============================================================================
+-- MODUL: NARZEDZIA - wykrywacz TNT, obiekt na celowniku (model, ukrywanie), wsiadanie do pojazdow RC
+-- Celownik = srodek ekranu (promien z kamery). Ukrycie obiektu jest tylko u Ciebie: obiekt staje sie
+-- niewidoczny i bez kolizji (nie jest usuwany - SA-MP dalej nim zarzadza), po ponownym wczytaniu
+-- (stream) ukrywa sie znowu, dopoki go nie przywrocisz w menu.
+-- ============================================================================
+A.register((function(A)
+local sqrt, floor, min = math.sqrt, math.floor, math.min
+
+local M = { id = 'tools', title = 'Narzedzia' }
+local FILE = A.DIR .. '\\narzedzia.json'
+
+local C = {
+    tnt = {},                  -- [model] = true: modele TNT (dodawane z celownika albo z listy obiektow)
+    tntHud = true, tntMarks = true, tntRadar = true, tntAlarm = true,
+    tntRange = 300,            -- [m] dalej TNT nie jest pokazywane
+    aimShow = true,            -- model i odleglosc obiektu na srodku ekranu
+    hideKey = 0x2E,            -- Delete: ukryj obiekt na celowniku
+    hidden = {},               -- ukryte pojedyncze obiekty: { model, x, y, z }
+    hiddenModels = {},         -- [model] = true: ukryte wszystkie obiekty tego modelu
+    rc = true, rcKey = 0x46,   -- F: wsiadanie do pojazdu RC
+}
+
+local RC_MODELS = { [441] = 'RC Bandit', [464] = 'RC Baron', [465] = 'RC Raider', [501] = 'RC Goblin',
+    [564] = 'RC Tiger', [594] = 'RC Cam' }
+local TNT_ALARM_R = 60         -- [m] alarm o nowym TNT blizej niz tyle
+local MAX_BLIPS = 30
+
+-- ------------------------------------------------------------ zapis
+local function keys(set)
+    local out = {}
+    for k in pairs(set) do out[#out + 1] = k end
+    table.sort(out)
+    return out
+end
+
+local function save()
+    A.saveJson(FILE, { tnt = keys(C.tnt), tntHud = C.tntHud, tntMarks = C.tntMarks, tntRadar = C.tntRadar,
+        tntAlarm = C.tntAlarm, tntRange = C.tntRange, aimShow = C.aimShow, hideKey = C.hideKey,
+        hidden = C.hidden, hiddenModels = keys(C.hiddenModels), rc = C.rc, rcKey = C.rcKey })
+end
+
+local function load()
+    local t = A.loadJson(FILE)
+    if not t then return end
+    for _, k in ipairs({ 'tntHud', 'tntMarks', 'tntRadar', 'tntAlarm', 'aimShow', 'rc' }) do
+        if type(t[k]) == 'boolean' then C[k] = t[k] end
+    end
+    if type(t.tntRange) == 'number' then C.tntRange = A.clamp(floor(t.tntRange), 20, 1000) end
+    for _, k in ipairs({ 'hideKey', 'rcKey' }) do
+        if type(t[k]) == 'number' and t[k] >= 0 and t[k] < 256 then C[k] = floor(t[k]) end
+    end
+    for _, k in ipairs({ 'tnt', 'hiddenModels' }) do
+        if type(t[k]) == 'table' then
+            for _, m in ipairs(t[k]) do if tonumber(m) then C[k][floor(tonumber(m))] = true end end
+        end
+    end
+    if type(t.hidden) == 'table' then
+        for _, h in ipairs(t.hidden) do
+            if type(h) == 'table' and tonumber(h[1]) and tonumber(h[2]) and tonumber(h[3]) and tonumber(h[4]) then
+                C.hidden[#C.hidden + 1] = { floor(tonumber(h[1])), tonumber(h[2]), tonumber(h[3]), tonumber(h[4]) }
+            end
+        end
+    end
+end
+
+-- ------------------------------------------------------------ obiekty (skan co 0.5 s)
+local objs = {}                -- ostatni skan: { h, m, x, y, z, d }, od najblizszego
+local byPtr = {}               -- wskaznik obiektu w pamieci gry -> wpis (do celownika)
+local tnts = {}                -- TNT w zasiegu, od najblizszego
+local tntSeen = nil            -- klucze pozycji TNT z poprzedniego skanu (alarm tylko o nowych)
+local nextScan = 0
+
+local function posKey(x, y, z) return floor(x * 2 + 0.5) .. ':' .. floor(y * 2 + 0.5) .. ':' .. floor(z * 2 + 0.5) end
+
+local function isHidden(m, x, y, z)
+    if C.hiddenModels[m] then return true end
+    for _, h in ipairs(C.hidden) do
+        if h[1] == m and (h[2] - x) ^ 2 + (h[3] - y) ^ 2 + (h[4] - z) ^ 2 < 0.25 then return true end
+    end
+    return false
+end
+
+local function setShown(h, on)
+    pcall(setObjectVisible, h, on)
+    pcall(setObjectCollision, h, on)
+end
+
+local function myPos()
+    local ok, x, y, z = pcall(getCharCoordinates, PLAYER_PED)
+    if ok and x then return x, y, z end
+    return nil
+end
+
+-- kierunek do punktu wzgledem kamery: 'przed Toba' / 'po lewej' / ...
+local function direction(px, py, x, y)
+    local okc, cx, cy = pcall(getActiveCameraCoordinates)
+    local oka, ax, ay = pcall(getActiveCameraPointAt)
+    if not (okc and oka and cx and ax) then return '' end
+    local ch = math.deg(math.atan2(-(ax - cx), ay - cy))
+    local th = math.deg(math.atan2(-(x - px), y - py))
+    local rel = (th - ch + 540) % 360 - 180
+    if math.abs(rel) <= 30 then return 'przed Toba' end
+    if math.abs(rel) >= 150 then return 'za Toba' end
+    if rel > 0 then return rel < 90 and 'z przodu po lewej' or 'po lewej' end
+    return rel > -90 and 'z przodu po prawej' or 'po prawej'
+end
+
+local function scan(px, py, pz)
+    local ok, list = pcall(getAllObjects)
+    if not ok or type(list) ~= 'table' then return end
+    local out, ptrs, tl = {}, {}, {}
+    for _, h in ipairs(list) do
+        if doesObjectExist(h) then
+            local m = getObjectModel(h)
+            local okc, _, x, y, z = pcall(getObjectCoordinates, h)
+            if okc and x then
+                local e = { h = h, m = m, x = x, y = y, z = z, d = sqrt((x - px) ^ 2 + (y - py) ^ 2 + (z - pz) ^ 2) }
+                out[#out + 1] = e
+                local okp, ptr = pcall(getObjectPointer, h)
+                if okp and ptr and ptr ~= 0 then ptrs[ptr] = e end
+                if isHidden(m, x, y, z) then setShown(h, false) end   -- po streamie obiekt wraca: ukryj znowu
+                if C.tnt[m] and e.d <= C.tntRange then tl[#tl + 1] = e end
+            end
+        end
+    end
+    table.sort(out, function(a, b) return a.d < b.d end)
+    table.sort(tl, function(a, b) return a.d < b.d end)
+    objs, byPtr, tnts = out, ptrs, tl
+    -- alarm: TNT, ktorego nie bylo w poprzednim skanie (pierwszy skan tylko zapamietuje)
+    local seen = {}
+    for _, e in ipairs(tl) do
+        local k = posKey(e.x, e.y, e.z)
+        seen[k] = true
+        if tntSeen and not tntSeen[k] and C.tntAlarm and e.d < TNT_ALARM_R then
+            A.say('TNT', ('Nowe TNT %.0f m od Ciebie (%s).'):format(e.d, direction(px, py, e.x, e.y)), 'FF3333')
+        end
+    end
+    tntSeen = seen
+end
+
+-- ------------------------------------------------------------ radar (tylko roznice, bez migania)
+local blips = {}               -- klucz pozycji -> blip
+
+local function clearBlips()
+    for k, b in pairs(blips) do
+        if doesBlipExist(b) then removeBlip(b) end
+        blips[k] = nil
+    end
+end
+
+local function syncBlips()
+    if not C.tntRadar then return clearBlips() end
+    local want = {}
+    for i = 1, min(#tnts, MAX_BLIPS) do
+        local e = tnts[i]
+        want[posKey(e.x, e.y, e.z)] = e
+    end
+    for k, b in pairs(blips) do
+        if not want[k] or not doesBlipExist(b) then
+            if doesBlipExist(b) then removeBlip(b) end
+            blips[k] = nil
+        end
+    end
+    for k, e in pairs(want) do
+        if not blips[k] then
+            local ok, h = pcall(addBlipForCoord, e.x, e.y, e.z)
+            if not ok or not h or not doesBlipExist(h) then break end
+            changeBlipDisplay(h, 2)
+            pcall(changeBlipColour, h, A.toInt32(0xFF2020FF))
+            blips[k] = h
+        end
+    end
+end
+
+-- ------------------------------------------------------------ celownik (srodek ekranu)
+local aim = nil                -- wpis obiektu na celowniku albo nil
+
+local function aimUpdate()
+    aim = nil
+    local okc, cx, cy, cz = pcall(getActiveCameraCoordinates)
+    local oka, ax, ay, az = pcall(getActiveCameraPointAt)
+    if not (okc and oka and cx and ax) then return end
+    local dx, dy, dz = ax - cx, ay - cy, az - cz
+    local l = sqrt(dx * dx + dy * dy + dz * dz)
+    if l < 1e-3 then return end
+    dx, dy, dz = dx / l * 150, dy / l * 150, dz / l * 150
+    local ok, hit, cp = pcall(processLineOfSight, cx, cy, cz, cx + dx, cy + dy, cz + dz,
+        true, false, false, true, false, false, false, false)
+    if not (ok and hit and cp and cp.entity and cp.entity ~= 0) then return end
+    local e = byPtr[cp.entity]
+    if e and doesObjectExist(e.h) then aim = e end
+end
+
+local function hideOne(e)
+    if not e or isHidden(e.m, e.x, e.y, e.z) then return end
+    C.hidden[#C.hidden + 1] = { e.m, floor(e.x * 100 + 0.5) / 100, floor(e.y * 100 + 0.5) / 100, floor(e.z * 100 + 0.5) / 100 }
+    setShown(e.h, false)
+    save()
+    A.say('Obiekty', ('Ukryto obiekt (model %d). Przywrocisz go w menu: Narzedzia.'):format(e.m), 'B48CFF')
+    if aim == e then aim = nil end
+end
+
+local function hideModel(m)
+    C.hiddenModels[m] = true
+    for _, e in ipairs(objs) do if e.m == m then setShown(e.h, false) end end
+    save()
+    A.say('Obiekty', ('Ukryte wszystkie obiekty modelu %d.'):format(m), 'B48CFF')
+end
+
+local function restoreAll()
+    for _, e in ipairs(objs) do
+        if isHidden(e.m, e.x, e.y, e.z) and doesObjectExist(e.h) then setShown(e.h, true) end
+    end
+    C.hidden, C.hiddenModels = {}, {}
+    save()
+end
+
+local function restoreModel(m)
+    C.hiddenModels[m] = nil
+    for _, e in ipairs(objs) do
+        if e.m == m and not isHidden(e.m, e.x, e.y, e.z) and doesObjectExist(e.h) then setShown(e.h, true) end
+    end
+    save()
+end
+
+local function setTnt(m, on)
+    C.tnt[m] = on or nil
+    save()
+    nextScan = 0
+    if on then A.say('TNT', ('Model %d dodany do wykrywacza TNT.'):format(m), 'FF3333') end
+end
+
+-- ------------------------------------------------------------ RC: wsiadanie (gra na to nie pozwala)
+-- Najblizszy wolny pojazd RC do 5 m, o ile nie stoi blizej zwykly pojazd (do niego wsiada sama gra).
+-- Serwer dostaje zwykle "wsiada do pojazdu" (jak przy F), potem postac trafia do srodka jak przy PutPlayerInVehicle.
+local function rcEnter()
+    if isCharInAnyCar(PLAYER_PED) then return end
+    local px, py, pz = myPos()
+    if not px then return end
+    local ok, list = pcall(getAllVehicles)
+    if not ok or type(list) ~= 'table' then return end
+    local best, bd, other
+    for _, v in ipairs(list) do
+        if doesVehicleExist(v) then
+            local okc, x, y, z = pcall(getCarCoordinates, v)
+            if okc and x then
+                local d = sqrt((x - px) ^ 2 + (y - py) ^ 2 + (z - pz) ^ 2)
+                if d < 5 then
+                    if RC_MODELS[getCarModel(v)] then
+                        local okD, drv = pcall(getDriverOfCar, v)
+                        local free = not (okD and drv and drv ~= -1 and doesCharExist(drv))
+                        if free and (not bd or d < bd) then best, bd = v, d end
+                    elseif not other or d < other then
+                        other = d
+                    end
+                end
+            end
+        end
+    end
+    if not best or (other and other < bd) then return end
+    local okI, has, vid = pcall(sampGetVehicleIdByCarHandle, best)
+    if okI and has and type(sampSendEnterVehicle) == 'function' then pcall(sampSendEnterVehicle, vid, false) end
+    if not pcall(warpCharIntoCar, PLAYER_PED, best) then pcall(taskWarpCharIntoCarAsDriver, PLAYER_PED, best) end
+    A.log('narzedzia', ('RC: wsiadam do %s (id %s, %.1f m)'):format(RC_MODELS[getCarModel(best)] or '?', tostring(vid), bd))
+end
+
+-- ------------------------------------------------------------ HUD
+local font, fontBig
+
+local function drawTntHud(px, py)
+    if not C.tntHud or not (#tnts > 0 or A.menuOpen) then return end
+    local txt
+    if #tnts == 0 then
+        txt = next(C.tnt) and '{AAAAAA}TNT: brak w zasiegu' or '{AAAAAA}TNT: dodaj model w menu (Narzedzia)'
+    else
+        local e = tnts[1]
+        local col = e.d < 10 and 'FF3333' or (e.d < 30 and 'FF9900' or 'FFD24A')
+        txt = ('{%s}TNT %.0f m {FFFFFF}%s'):format(col, e.d, direction(px, py, e.x, e.y))
+            .. (#tnts > 1 and ('{AAAAAA}  (w zasiegu %d)'):format(#tnts) or '')
+    end
+    local w = renderGetFontDrawTextLength(fontBig, A.stripColors(txt))
+    local x, y = A.hudPlace('tnt', w + 18, 24, 0.40, 0.18)
+    renderDrawBox(x, y, w + 18, 24, 0x90000000)
+    renderDrawBox(x, y, 3, 24, #tnts > 0 and (tnts[1].d < 10 and 0xFFFF3333 or 0xFFFF9900) or 0xFF666666)
+    renderFontDrawText(fontBig, txt, x + 10, y + 3, 0xFFFFFFFF)
+end
+
+local function drawTntMarks(px, py, pz)
+    if not C.tntMarks then return end
+    for i = 1, min(#tnts, 20) do
+        local e = tnts[i]
+        if isPointOnScreen(e.x, e.y, e.z + 0.8, 0.5) then
+            local sx, sy = convert3DCoordsToScreen(e.x, e.y, e.z + 0.8)
+            if sx then
+                local d = sqrt((e.x - px) ^ 2 + (e.y - py) ^ 2 + (e.z - pz) ^ 2)
+                local label = ('TNT %.0f m'):format(d)
+                local w = renderGetFontDrawTextLength(font, label)
+                renderDrawBox(sx - w / 2 - 4, sy - 2, w + 8, 16, 0xA0000000)
+                renderFontDrawText(font, label, sx - w / 2, sy, d < 10 and 0xFFFF3333 or 0xFFFF9900)
+            end
+        end
+    end
+end
+
+local function drawAim(px, py, pz)
+    if not C.aimShow or isCharInAnyCar(PLAYER_PED) then return end
+    local cx, cy = A.sw / 2, A.sh / 2
+    renderDrawBox(cx - 1, cy - 1, 3, 3, 0xC0FFFFFF)
+    if not aim then return end
+    local d = sqrt((aim.x - px) ^ 2 + (aim.y - py) ^ 2 + (aim.z - pz) ^ 2)
+    local tnt = C.tnt[aim.m]
+    local txt = ('%smodel %d {FFFFFF}%.1f m  {AAAAAA}%s = ukryj'):format(tnt and '{FF3333}TNT ' or '{FFD24A}', aim.m, d,
+        A.keyName(C.hideKey))
+    local w = renderGetFontDrawTextLength(font, A.stripColors(txt))
+    renderDrawBox(cx - w / 2 - 6, cy + 14, w + 12, 18, 0xA0000000)
+    renderFontDrawText(font, txt, cx - w / 2, cy + 16, 0xFFFFFFFF)
+end
+
+-- ------------------------------------------------------------ modul
+local hideReq, rcReq = false, false
+local nextBlips = 0
+
+function M.init()
+    load()
+    font = renderCreateFont('Arial', 9, 5)
+    fontBig = renderCreateFont('Arial', 11, 5)
+end
+
+function M.onKey(vk)
+    if A.chatInputActive() or A.dialogActive() then return end
+    if vk == C.hideKey and C.hideKey ~= 0 then hideReq = true end
+    if C.rc and vk == C.rcKey and C.rcKey ~= 0 then rcReq = true end
+end
+
+function M.frame(now)
+    if not isPlayerPlaying(PLAYER_HANDLE) then return end
+    local px, py, pz = myPos()
+    if not px then return end
+    if now >= nextScan then
+        nextScan = now + 0.5
+        scan(px, py, pz)
+    end
+    if C.aimShow or hideReq or A.menuOpen then aimUpdate() end
+    if hideReq then
+        hideReq = false
+        if aim then hideOne(aim) end
+    end
+    if rcReq then
+        rcReq = false
+        rcEnter()
+    end
+    if now >= nextBlips then
+        nextBlips = now + 1
+        pcall(syncBlips)
+    end
+    if not A.drawOk then return end
+    drawTntMarks(px, py, pz)
+    drawTntHud(px, py)
+    drawAim(px, py, pz)
+end
+
+function M.disable() clearBlips() end
+
+function M.terminate(quit)
+    if not quit then clearBlips() end
+end
+
+function M.status() return ('TNT w zasiegu %d, ukryte %d'):format(#tnts, #C.hidden) end
+
+-- ------------------------------------------------------------ menu
+function M.menu()
+    local ui, im = A.ui, A.imgui
+    local px, py, pz = myPos()
+    ui.cols(function()
+        ui.group('Wykrywacz TNT', function()
+            if #tnts > 0 then
+                ui.kv('Najblizsze', ('%.0f m'):format(tnts[1].d), tnts[1].d < 10 and 0xFFFF3333 or 0xFFFF9900)
+                ui.kv('W zasiegu', #tnts)
+            end
+            ui.checks({
+                { 'HUD##tnt', function() return C.tntHud end, function(v) C.tntHud = v; save() end,
+                  'Na ekranie: odleglosc i kierunek do najblizszego TNT. Przeciagniesz go, gdy menu jest otwarte.' },
+                { 'Napisy 3D##tnt', function() return C.tntMarks end, function(v) C.tntMarks = v; save() end,
+                  'Nad kazdym TNT napis z odlegloscia.' },
+                { 'Radar##tnt', function() return C.tntRadar end, function(v) C.tntRadar = v; save(); nextBlips = 0 end,
+                  'TNT jako czerwone punkty na radarze.' },
+                { 'Alarm##tnt', function() return C.tntAlarm end, function(v) C.tntAlarm = v; save() end,
+                  'Komunikat na czacie, gdy blizej niz ' .. TNT_ALARM_R .. ' m pojawi sie nowe TNT.' },
+            }, 2)
+            ui.sliderInt('Zasieg##tnt', function() return C.tntRange end, function(v) C.tntRange = v; save() end,
+                50, 1000, '%d m', 'Dalsze TNT nie sa pokazywane. Serwer i tak wysyla obiekty tylko z okolicy.')
+            local models = keys(C.tnt)
+            if #models == 0 then
+                ui.wrap('Nie znam jeszcze modelu TNT. Wyceluj w TNT srodkiem ekranu (kropka) i kliknij "To TNT" '
+                    .. 'w grupie Celownik - albo znajdz je na liscie obiektow obok.', 0xFFFFD24A)
+            else
+                for _, m in ipairs(models) do
+                    ui.textDim('model ' .. m)
+                    im.SameLine(10 + ui.W - 22)
+                    if im.SmallButton('x##tntdel' .. m) then setTnt(m, false) end
+                end
+            end
+        end)
+        ui.group('Celownik', function()
+            ui.check('Podglad na celowniku', function() return C.aimShow end, function(v) C.aimShow = v; save() end,
+                'Kropka na srodku ekranu; pod nia model i odleglosc obiektu, w ktory celujesz.')
+            ui.keyButton('Ukryj##aimk', function() return C.hideKey end, function(vk) C.hideKey = vk; save() end,
+                'Ukrywa obiekt na celowniku: znika i mozna przez niego przejsc (tylko u Ciebie).', true)
+            if aim then
+                ui.kv('Na celowniku', ('model %d, %.1f m'):format(aim.m, px and sqrt((aim.x - px) ^ 2 + (aim.y - py) ^ 2
+                    + (aim.z - pz) ^ 2) or aim.d), C.tnt[aim.m] and 0xFFFF3333 or 0xFFFFD24A)
+                local e = aim
+                ui.buttons({
+                    { C.tnt[e.m] and 'Nie TNT##aim' or 'To TNT##aim', function() setTnt(e.m, not C.tnt[e.m]) end,
+                      'Dodaje / usuwa ten model z wykrywacza TNT.' },
+                    { 'Ukryj##aim', function() hideOne(e) end, 'Ukrywa tylko ten jeden obiekt.' },
+                    { 'Ukryj model##aim', function() hideModel(e.m) end, 'Ukrywa wszystkie obiekty tego modelu.' },
+                })
+            else
+                ui.textDim('Na celowniku: nic (celuj srodkiem ekranu).')
+            end
+            local hm = keys(C.hiddenModels)
+            ui.kv('Ukryte', ('%d obiektow%s'):format(#C.hidden, #hm > 0 and (', ' .. #hm .. ' modeli') or ''))
+            for _, m in ipairs(hm) do
+                ui.textDim('caly model ' .. m)
+                im.SameLine(10 + ui.W - 60)
+                if im.SmallButton('Przywroc##hm' .. m) then restoreModel(m) end
+            end
+            if (#C.hidden > 0 or #hm > 0) and ui.button('Przywroc wszystkie##hid', nil, 'Wszystkie ukryte obiekty wracaja.') then
+                restoreAll()
+            end
+        end)
+    end, function()
+        ui.group('Obiekty w poblizu', function()
+            ui.textDim('Najblizsze obiekty (szukanie modelu TNT):')
+            im.BeginChild('##toolsobj', im.ImVec2(ui.W, 230), true)
+            for i = 1, min(#objs, 40) do
+                local e = objs[i]
+                local hid = isHidden(e.m, e.x, e.y, e.z)
+                local line = ('%5d   %6.1f m%s'):format(e.m, e.d, hid and '  ukryty' or '')
+                if C.tnt[e.m] then ui.textCol(0xFFFF3333, line .. '  TNT') else ui.text(line) end
+                im.SameLine(ui.W - 92)
+                if im.SmallButton((C.tnt[e.m] and 'nie TNT' or 'TNT') .. '##ot' .. i) then setTnt(e.m, not C.tnt[e.m]) end
+                if not hid then
+                    im.SameLine()
+                    if im.SmallButton('ukryj##oh' .. i) then hideOne(e) end
+                end
+            end
+            im.EndChild()
+        end)
+        ui.group('Pojazdy RC', function()
+            ui.check('Wsiadanie do RC', function() return C.rc end, function(v) C.rc = v; save() end,
+                'RC Goblin, Bandit, Baron, Raider, Tiger, Cam: podejdz (do 5 m) i wcisnij klawisz. Wysiadasz jak zwykle (F).')
+            if C.rc then
+                ui.keyButton('Klawisz##rck', function() return C.rcKey end, function(vk) C.rcKey = vk; save() end,
+                    'Domyslnie F, jak przy zwyklym pojezdzie. Gdy blizej stoi zwykly pojazd, wsiada do niego gra.')
+            end
+        end)
+    end)
+end
+
+M.test = { scan = scan, objs = function() return objs end, tnts = function() return tnts end, C = C,
+    hideOne = hideOne, setTnt = setTnt, isHidden = isHidden, rcEnter = rcEnter, restoreAll = restoreAll,
+    aimUpdate = aimUpdate, aim = function() return aim end, byPtr = function() return byPtr end }
+
+return M
+end)(A))
+
+-- ============================================================================
 -- MENU (mimgui) + UI helpery
 -- ============================================================================
 do
@@ -14890,7 +15354,7 @@ A.register({
 })
 
 -- kolejnosc zakladek
-local TAB_ORDER = { 'tracker', 'graffiti', 'boty', 'pool', 'gpt', 'settings' }
+local TAB_ORDER = { 'tracker', 'graffiti', 'boty', 'tools', 'pool', 'gpt', 'settings' }
 
 local function sortTabs()
     local rank = {}

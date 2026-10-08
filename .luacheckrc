@@ -11,6 +11,12 @@ ignore = {
 
 -- API MoonLoadera / SF.lua (SAMPFUNCS) uzywane w skrypcie
 read_globals = {
+    "setObjectVisible",
+    "setObjectCollision",
+    "sampGetVehicleIdByCarHandle",
+    "sampSendEnterVehicle",
+    "warpCharIntoCar",
+    "taskWarpCharIntoCarAsDriver",
     "PLAYER_HANDLE",
     "PLAYER_PED",
     "addBlipForCoord",

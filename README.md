@@ -16,6 +16,9 @@ Jeden plik, `antek.lua`, w 100% ASCII — kodowanie pliku nie ma znaczenia dla M
 | Boty | Karty Bot | Kasyno: automatyczna gra w karty |
 | | Górnik Bot | Klawisze przy wydobyciu, pełny automat (bieg do rud, sprzedaż), znaczniki rud |
 | | Makro | Szybkie wciskanie klawisza (domyślnie `Y`) |
+| Narzędzia | Wykrywacz TNT | HUD z odległością i kierunkiem do najbliższego TNT, napisy 3D, radar, alarm na czacie |
+| | Celownik | Model i odległość obiektu na środku ekranu; ukrywanie obiektów (znikają i nie mają kolizji, tylko u Ciebie) |
+| | Pojazdy RC | Wsiadanie do RC Goblin / Bandit / Baron / Raider / Tiger / Cam klawiszem F |
 | Bilard | Bilard | Tor bili, odbicia, łuzy, zalecana siła, planer zagrania, kalibracja |
 | SAMPGPT | SAMPGPT | Asystent AI (Gemini): `/ai`, quizy i rebusy z czatu/ekranu, OX, mapa z pamięci gry |
 | Ustawienia | — | Klawisz menu, panic key |
@@ -51,6 +54,8 @@ Wszystkie zmienisz w menu.
 | `F9` | Karty Bot start / stop |
 | `←` / `→` | Makro włącz / wyłącz |
 | `F10` / `F11` / `F12` | SAMPGPT: mapa / wpisz ostatnią odpowiedź / OX z ekranu |
+| `Delete` | ukryj obiekt na celowniku (środek ekranu) |
+| `F` | wsiądź do pojazdu RC (do 5 m) |
 | `/ai <pytanie>` | SAMPGPT na czacie |
 
 HUD-y przeciągasz myszą, gdy menu jest otwarte.
@@ -60,7 +65,7 @@ HUD-y przeciągasz myszą, gdy menu jest otwarte.
 | Ścieżka | Zawartość |
 |---|---|
 | `moonloader/config/antek/antek.json` | menu, klawisze, moduły, pozycje HUD |
-| `moonloader/config/antek/*.json` | ustawienia modułów (`graffiti`, `strefy`, `tracker`, `gornik`, `rudy`, `karta`, `autoy`, `statuetki`, `walizki`) |
+| `moonloader/config/antek/*.json` | ustawienia modułów (`graffiti`, `strefy`, `tracker`, `gornik`, `rudy`, `karta`, `autoy`, `statuetki`, `walizki`, `narzedzia` — modele TNT i ukryte obiekty) |
 | `moonloader/config/antek/pool.lua` | kalibracja bilarda |
 | `moonloader/config/antek/strefy_log.txt` | log alertów stref (rotacja przy 1 MB) |
 | `moonloader/config/sampgpt_*.txt` | SAMPGPT: klucz, ustawienia, baza odpowiedzi, wiedza o serwerze, statystyki |
@@ -69,6 +74,13 @@ HUD-y przeciągasz myszą, gdy menu jest otwarte.
 
 Webhook Discorda i klucz Gemini są wpisane w `antek.lua` — nie publikuj tego pliku (ani repo) publicznie.
 Uszkodzony plik JSON jest odkładany jako `.bak`, a moduł startuje z ustawieniami domyślnymi.
+
+## Wykrywacz TNT — pierwsze użycie
+
+Skrypt nie zna z góry modelu TNT (serwer robi je z klocka z teksturą). Raz: podejdź do TNT, wyceluj w nie kropką
+na środku ekranu i w menu **Narzędzia → Celownik** kliknij **To TNT** (albo znajdź je na liście *Obiekty w pobliżu*).
+Model zapisuje się na stałe; od tej chwili każde TNT w zasięgu jest na HUD-zie, radarze i z napisem 3D.
+Jeśli ten sam model serwer używa też do innych klocków, detektor pokaże i je.
 
 ## Strefy Bot — jak jeździ
 
