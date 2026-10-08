@@ -4462,22 +4462,17 @@ local C = {
 local function gangLabel() return C.gang ~= '' and C.gang or 'nasz gang' end
 
 local BATCH_QUIET, BATCH_MAX = 0.4, 2
-local SEND_GAP, MAX_TRIES = 1.0, 5
+local SEND_GAP, MAX_TRIES, OUTBOX_MAX = 1.0, 5, 30
 local GAP_SECONDS, MAX_CATCHUP = 5, 300
 local HEARTBEAT = 300
 local LOG_MAX_BYTES = 1024 * 1024
 local CONT_END, CONT_START = '\172', '\187'   -- serwer tnie dlugie komunikaty (CP1250)
-local RECENT_MAX = 25
 
-local setupOpen, whBuf, gnBuf = nil, nil, nil
-local recent = {}                              -- ostatnie wpisy logu (menu)
 local stats = { ok = 0, fail = 0, events = 0 }
 
 -- ------------------------------------------------------------ log
 local function logf(msg)
     A.log('strefy', msg)
-    recent[#recent + 1] = os.date('%H:%M:%S ') .. msg
-    if #recent > RECENT_MAX then table.remove(recent, 1) end
     local f = io.open(LOG_FILE, 'ab')
     if f then
         f:write(os.date('%Y-%m-%d %H:%M:%S') .. '  ' .. msg .. '\r\n')
@@ -4679,13 +4674,18 @@ local function removeSendFiles(n)
     os.remove(fpath(n, 'code', 'txt'))
 end
 
-local function enqueueSend(json, label, detected)
+-- webhook trafia do linii polecen curl / PowerShell: bez spacji i cudzyslowow
+local function enqueueSend(payload, label, detected)
     if not C.discord then return end
-    if not C.webhook:find('^https://') then
+    if not C.webhook:find('^https://[^%s"\']+$') then
         logf('Brak poprawnego webhooka - nie wysylam: ' .. label)
         return
     end
-    outbox[#outbox + 1] = { json = json, label = label, tries = 0, notBefore = 0, detected = detected or os.clock() }
+    if #outbox >= OUTBOX_MAX then                 -- dlugo bez sieci: kolejka nie rosnie bez konca
+        stats.fail = stats.fail + 1
+        logf('Kolejka pelna - pomijam najstarszy: ' .. table.remove(outbox, 1).label)
+    end
+    outbox[#outbox + 1] = { json = payload, label = label, tries = 0, notBefore = 0, detected = detected or os.clock() }
 end
 
 local function retryLater(p, why, delay)
@@ -4708,6 +4708,11 @@ local function procExit(p)
     return A.proc.finish(p)
 end
 
+-- proces jeszcze dziala (curl po 8 s, PowerShell po 15 s): zabity - inaczej moglby wyslac alert drugi raz
+local function stopProc(proc)
+    if A.proc.running(proc) then A.proc.kill(proc) else A.proc.finish(proc) end
+end
+
 local function startFallback(p)
     p.fallback, p.ft = true, os.clock()
     local ps = '[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; '
@@ -4715,13 +4720,13 @@ local function startFallback(p)
         .. '\' -Method Post -ContentType \'application/json\' -InFile \'' .. fpath(p.n, 'payload', 'json')
         .. '\'; Set-Content -Path \'' .. fpath(p.n, 'code', 'txt') .. '\' -Value ([int]$r.StatusCode) } '
         .. 'catch { Set-Content -Path \'' .. fpath(p.n, 'code', 'txt') .. '\' -Value (\'ERR \' + $_.Exception.Message) }'
-    A.proc.finish(p.proc)
+    stopProc(p.proc)
     p.proc = A.proc.spawn('powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "' .. ps .. '"')
     logf('Wysylka zapasowa przez PowerShell (start: ' .. tostring(p.proc ~= nil) .. ')')
 end
 
 local function finishInflight()
-    A.proc.finish(inflight.proc)
+    stopProc(inflight.proc)
     removeSendFiles(inflight.n)
     inflight = nil
 end
@@ -4752,52 +4757,57 @@ local function processInflight()
     if not p then return end
     local c = os.clock()
 
-    local hdr = A.readFile(fpath(p.n, 'hdr', 'txt'))
-    if hdr and #hdr > 0 then
+    -- curl: wynik dopiero po wyjsciu procesu (cialo z retry_after / bledem jest juz zapisane,
+    -- ostatnia linia statusu jest odpowiedzia Discorda, nie proxy); po 8 s bierzemy to, co jest
+    if not p.fallback then
+        local exited = procExit(p.proc) ~= nil
+        local hdr = A.readFile(fpath(p.n, 'hdr', 'txt'))
         local status
-        for line in hdr:gmatch('[^\r\n]+') do
-            local st = line:match('^HTTP/%S+%s+(%d+)')
-            if st then status = tonumber(st) end
+        if hdr then
+            for line in hdr:gmatch('[^\r\n]+') do
+                local st = line:match('^HTTP/%S+%s+(%d+)')
+                if st then status = tonumber(st) end
+            end
         end
-        if not status and procExit(p.proc) == nil then return end   -- naglowki jeszcze sie zapisuja
-        local body = A.readFile(fpath(p.n, 'body', 'txt')) or ''
-        finishInflight()
-        if status and status >= 200 and status < 300 then
-            stats.ok = stats.ok + 1
-            logf('Discord: OK (HTTP ' .. status .. ', ' .. took(p) .. ') - ' .. p.label)
-        elseif status == 429 then
-            retryLater(p, 'limit (429)', (tonumber(body:match('"retry_after"%s*:%s*([%d%.]+)')) or 1) + 0.3)
-        elseif status and status >= 500 then
-            retryLater(p, 'blad Discorda (HTTP ' .. status .. ')', 2 * p.tries)
-        else
-            stats.fail = stats.fail + 1
-            logf('Discord: BLAD HTTP ' .. tostring(status) .. ' - ' .. p.label .. ' | ' .. body:sub(1, 200)
-                .. ((status == 401 or status == 404) and ' (sprawdz webhook)' or ''))
+        if status and (exited or c - p.t > 8) then
+            local body = A.readFile(fpath(p.n, 'body', 'txt')) or ''
+            finishInflight()
+            if status >= 200 and status < 300 then
+                stats.ok = stats.ok + 1
+                logf('Discord: OK (HTTP ' .. status .. ', ' .. took(p) .. ') - ' .. p.label)
+            elseif status == 429 then
+                retryLater(p, 'limit (429)', (tonumber(body:match('"retry_after"%s*:%s*([%d%.]+)')) or 1) + 0.3)
+            elseif status >= 500 then
+                retryLater(p, 'blad Discorda (HTTP ' .. status .. ')', 2 * p.tries)
+            else
+                stats.fail = stats.fail + 1
+                logf('Discord: BLAD HTTP ' .. status .. ' - ' .. p.label .. ' | ' .. body:sub(1, 200)
+                    .. ((status == 401 or status == 404) and ' (sprawdz webhook)' or ''))
+            end
+        elseif exited or c - p.t > 8 then
+            logf('curl bez odpowiedzi (kod ' .. tostring(p.proc and p.proc.code or '?') .. ') - probuje PowerShell...')
+            startFallback(p)
         end
         return
     end
 
-    if p.fallback then
-        local code = A.readFile(fpath(p.n, 'code', 'txt'))
-        if code and #code > 0 then
-            code = code:gsub('%s+$', '')
-            finishInflight()
-            if code:match('^2%d%d$') then
-                stats.ok = stats.ok + 1
-                logf('Discord (PowerShell): OK (HTTP ' .. code .. ', ' .. took(p) .. ') - ' .. p.label)
-            elseif code:match('429') or code:match('^5%d%d') then
-                retryLater(p, 'PowerShell: ' .. code, 2 * p.tries)
-            else
-                stats.fail = stats.fail + 1
-                logf('Discord (PowerShell): BLAD ' .. code .. ' - ' .. p.label)
-            end
-        elseif (procExit(p.proc) ~= nil and c - p.ft > 1) or c - p.ft > 15 then
-            finishInflight()
-            retryLater(p, 'brak polaczenia (curl i PowerShell)', 3 * p.tries)
+    -- PowerShell (stary plik naglowkow curl jest tu ignorowany)
+    local code = A.readFile(fpath(p.n, 'code', 'txt'))
+    if code and #code > 0 then
+        code = code:gsub('%s+$', '')
+        finishInflight()
+        if code:match('^2%d%d$') then
+            stats.ok = stats.ok + 1
+            logf('Discord (PowerShell): OK (HTTP ' .. code .. ', ' .. took(p) .. ') - ' .. p.label)
+        elseif code:match('429') or code:match('^5%d%d') then
+            retryLater(p, 'PowerShell: ' .. code, 2 * p.tries)
+        else
+            stats.fail = stats.fail + 1
+            logf('Discord (PowerShell): BLAD ' .. code .. ' - ' .. p.label)
         end
-    elseif procExit(p.proc) ~= nil or c - p.t > 8 then
-        logf('curl bez odpowiedzi (kod ' .. tostring(p.proc and p.proc.code or '?') .. ') - probuje PowerShell...')
-        startFallback(p)
+    elseif (procExit(p.proc) ~= nil and c - p.ft > 1) or c - p.ft > 15 then
+        finishInflight()
+        retryLater(p, 'brak polaczenia (curl i PowerShell)', 3 * p.tries)
     end
 end
 
@@ -4813,6 +4823,9 @@ local function queueEvent(kind, attacker, zone, delay)
     if lastByKey[key] and t - lastByKey[key] < C.cooldown then
         logf('Pominieto powtorke (' .. kind .. '): ' .. attacker .. ' (strefa: ' .. tostring(zone) .. ')')
         return
+    end
+    for k, v in pairs(lastByKey) do                 -- przeterminowane klucze (tabela nie rosnie przez cala sesje)
+        if t - v >= C.cooldown then lastByKey[k] = nil end
     end
     lastByKey[key] = t
     stats.events = stats.events + 1
@@ -4893,8 +4906,23 @@ end
 local CAPTURE = 60
 local ATT_LAG = 1.0                             -- komunikat o ataku przychodzi ok. 1 s po starcie odliczania na serwerze
 local ATT = {}                                  -- { zone, t0 } - aktywne przejecia
-local attFont, zoneFont
+local hudFont                                   -- wspolny font obu HUD-ow
+local attLines, attW, attN = nil, 0, -1          -- HUD ataku: tekst budowany tylko, gdy cos sie zmieni
 local unknownLogged = 0
+
+local function linesWidth(lines)
+    local w = 0
+    for i = 1, #lines do w = math.max(w, renderGetFontDrawTextLength(hudFont, lines[i])) end
+    return w
+end
+
+local function hudBox(id, lines, w, fy, col)
+    local h = #lines * 16 + 6
+    local x, y = A.hudPlace(id, w + 16, h, 0.5, fy)
+    renderDrawBox(x, y, w + 16, h, 0x90000000)
+    renderDrawBox(x, y, 3, h, col)
+    for i = 1, #lines do renderFontDrawText(hudFont, lines[i], x + 9, y + 3 + (i - 1) * 16, 0xFFFFFFFF) end
+end
 
 local function gangTag()
     local last = C.gang:match('(%S+)%s*$')
@@ -4942,20 +4970,23 @@ local function drawAttackHud(now)
         if now - ATT[i].t0 >= CAPTURE then table.remove(ATT, i) end
     end
     if not C.attackHud or not A.drawOk or (#ATT == 0 and not A.menuOpen) then return end
-    attFont = attFont or renderCreateFont('Arial', 9, 5)
-    local lines = {}
-    for _, a in ipairs(ATT) do
-        lines[#lines + 1] = string.format('{FF9900}%s{FFFFFF} atakuje strefe: {FFD24A}%s', gangTag(), a.zone)
-        lines[#lines + 1] = string.format('{AAAAAA}Przejecie za: {FFFFFF}%d s', math.max(0, math.ceil(CAPTURE - (now - a.t0))))
+    hudFont = hudFont or renderCreateFont('Arial', 9, 5)
+    local fresh = attLines ~= nil and attN == #ATT
+    for i = 1, #ATT do
+        local a = ATT[i]
+        local s = math.max(0, math.ceil(CAPTURE - (now - a.t0)))
+        if a.shown ~= s then a.shown, fresh = s, false end
     end
-    if #lines == 0 then lines = { '{AAAAAA}HUD ataku stref' } end
-    local w = 0
-    for _, l in ipairs(lines) do w = math.max(w, renderGetFontDrawTextLength(attFont, l)) end
-    local h = #lines * 16 + 6
-    local x, y = A.hudPlace('strefyatak', w + 16, h, 0.5, 0.22)
-    renderDrawBox(x, y, w + 16, h, 0x90000000)
-    renderDrawBox(x, y, 3, h, 0xFFFF9900)
-    for i, l in ipairs(lines) do renderFontDrawText(attFont, l, x + 9, y + 3 + (i - 1) * 16, 0xFFFFFFFF) end
+    if not fresh then
+        local lines = {}
+        for _, a in ipairs(ATT) do
+            lines[#lines + 1] = string.format('{FF9900}%s{FFFFFF} atakuje strefe: {FFD24A}%s', gangTag(), a.zone)
+            lines[#lines + 1] = string.format('{AAAAAA}Przejecie za: {FFFFFF}%d s', a.shown)
+        end
+        if #lines == 0 then lines[1] = '{AAAAAA}HUD ataku stref' end
+        attLines, attN, attW = lines, #ATT, linesWidth(lines)
+    end
+    hudBox('strefyatak', attLines, attW, 0.22, 0xFFFF9900)
 end
 
 -- ------------------------------------------------------------ strefy: pozycje (stale, A.GANG_ZONES) i stan (czat + /strefy)
@@ -4966,21 +4997,30 @@ local ZONES = {}                                 -- id -> { id, name, x, y, z, i
 for id, z in pairs(A.GANG_ZONES or {}) do
     ZONES[id] = { id = id, name = z[4] or ('strefa ' .. id), x = z[1], y = z[2], z = z[3], int = 0 }
 end
+local ZIDS = {}                                  -- id stref posortowane (lista w menu; zbior stref jest staly)
+for id in pairs(ZONES) do ZIDS[#ZIDS + 1] = id end
+table.sort(ZIDS)
 local EN = {}                                    -- aktywne ataki NA NAS: { id, name, zone, attacker, t0 }
-local enemyFont
+local enLines, enW, enN = nil, 0, -1             -- HUD wroga: tekst budowany tylko, gdy cos sie zmieni
+local TPTXT = {}                                 -- id strefy -> tekst najblizszego teleportu (staly)
 local ZS = {}                                    -- id -> { mine, owner, cd (epoch, 0 = teraz), busy, lockUntil, t, src }
 local ZEV = {}                                   -- komunikaty o strefach dla Strefy Bota: { t (A.now), kind, id }
 local ZSNAP = { at = 0, ok = nil, rows = 0 }     -- ostatni pelny odczyt /strefy
 
-local SFOLD = {
-    [0xA5] = 'a', [0xB9] = 'a', [0xC6] = 'c', [0xE6] = 'c', [0xCA] = 'e', [0xEA] = 'e', [0xA3] = 'l', [0xB3] = 'l',
-    [0xD1] = 'n', [0xF1] = 'n', [0xD3] = 'o', [0xF3] = 'o', [0x8C] = 's', [0x9C] = 's', [0x8F] = 'z', [0x9F] = 'z',
-    [0xAF] = 'z', [0xBF] = 'z',
-}
+-- bajt CP1250 >= 128 -> litera ASCII albo '?' (gsub z tabela: bez closure na kazde wywolanie)
+local SFOLD = {}
+do
+    local fold = {
+        [0xA5] = 'a', [0xB9] = 'a', [0xC6] = 'c', [0xE6] = 'c', [0xCA] = 'e', [0xEA] = 'e', [0xA3] = 'l', [0xB3] = 'l',
+        [0xD1] = 'n', [0xF1] = 'n', [0xD3] = 'o', [0xF3] = 'o', [0x8C] = 's', [0x9C] = 's', [0x8F] = 'z', [0x9F] = 'z',
+        [0xAF] = 'z', [0xBF] = 'z',
+    }
+    for b = 128, 255 do SFOLD[string.char(b)] = fold[b] or '?' end
+end
 
 -- tekst gry (CP1250) -> male litery ASCII bez kolorow, do porownan
 local function sfold(s)
-    s = A.stripColors(tostring(s or '')):gsub('[\128-\255]', function(c) return SFOLD[c:byte()] or '?' end)
+    s = A.stripColors(tostring(s or '')):gsub('[\128-\255]', SFOLD)
     return (s:lower():gsub('%s+', ' '))
 end
 
@@ -4990,13 +5030,18 @@ local function zoneParts(zone)
     return id, name ~= '' and name or tostring(zone)
 end
 
-local function nearestTele(x, y)
+-- najblizszy teleport do strefy (HUD wroga); liczony raz na strefe - pozycje sa stale
+local function teleText(z)
+    local s = TPTXT[z.id]
+    if s then return s end
     local best, bd
     for _, tp in ipairs(A.TELEPORTS or {}) do
-        local d = (tp[2] - x) ^ 2 + (tp[3] - y) ^ 2
+        local d = (tp[2] - z.x) ^ 2 + (tp[3] - z.y) ^ 2
         if not bd or d < bd then best, bd = tp, d end
     end
-    return best, bd and math.sqrt(bd)
+    s = best and string.format(' | TP {FF66FF}%s{AAAAAA} (%.0f m od strefy)', best[1], math.sqrt(bd)) or ''
+    TPTXT[z.id] = s
+    return s
 end
 
 -- czy tekst (wlasciciel strefy) to nasz gang: pelna nazwa albo tag (np. CWL) jako osobne slowo
@@ -5114,30 +5159,35 @@ local function drawEnemyHud(now)
         if now - EN[i].t0 > 240 then table.remove(EN, i) end
     end
     if not C.enemyHud or not A.drawOk or (#EN == 0 and not A.menuOpen) then return end
-    enemyFont = enemyFont or renderCreateFont('Arial', 9, 5)
-    local lines = {}
-    local px, py = getCharCoordinates(PLAYER_PED)
-    for _, e in ipairs(EN) do
-        lines[#lines + 1] = string.format('{FF3333}ATAK NA STREFE {FFFFFF}%s{AAAAAA}  (%s)', e.zone, tostring(e.attacker):sub(1, 28))
-        local z = e.id and ZONES[e.id]
-        local where
-        if z then
-            local tp, d = nearestTele(z.x, z.y)
-            where = string.format('{AAAAAA}trwa {FFFFFF}%s{AAAAAA} | od Ciebie {FFFFFF}%.0f m{AAAAAA}%s', fmtMin(now - e.t0),
-                math.sqrt((z.x - px) ^ 2 + (z.y - py) ^ 2), tp and string.format(' | TP {FF66FF}%s{AAAAAA} (%.0f m od strefy)', tp[1], d) or '')
-        else
-            where = string.format('{AAAAAA}trwa {FFFFFF}%s', fmtMin(now - e.t0))
+    hudFont = hudFont or renderCreateFont('Arial', 9, 5)
+    -- co klatke tylko liczby (sekundy, metry); tekst i szerokosc od nowa, gdy ktoras sie zmieni
+    local fresh = enLines ~= nil and enN == #EN
+    if #EN > 0 then
+        local px, py = getCharCoordinates(PLAYER_PED)
+        for i = 1, #EN do
+            local e = EN[i]
+            local z = e.id and ZONES[e.id]
+            local s = math.floor(now - e.t0)
+            local d = z and math.floor(math.sqrt((z.x - px) ^ 2 + (z.y - py) ^ 2) + 0.5) or -1
+            if e.hs ~= s or e.hd ~= d or e.ha ~= e.attacker then e.hs, e.hd, e.ha, fresh = s, d, e.attacker, false end
         end
-        lines[#lines + 1] = where
     end
-    if #lines == 0 then lines = { '{AAAAAA}HUD ataku na nasze strefy' } end
-    local w = 0
-    for _, l in ipairs(lines) do w = math.max(w, renderGetFontDrawTextLength(enemyFont, l)) end
-    local h = #lines * 16 + 6
-    local x, y = A.hudPlace('strefywrog', w + 16, h, 0.5, 0.30)
-    renderDrawBox(x, y, w + 16, h, 0x90000000)
-    renderDrawBox(x, y, 3, h, 0xFFFF3333)
-    for i, l in ipairs(lines) do renderFontDrawText(enemyFont, l, x + 9, y + 3 + (i - 1) * 16, 0xFFFFFFFF) end
+    if not fresh then
+        local lines = {}
+        for _, e in ipairs(EN) do
+            lines[#lines + 1] = string.format('{FF3333}ATAK NA STREFE {FFFFFF}%s{AAAAAA}  (%s)', e.zone, tostring(e.attacker):sub(1, 28))
+            local z = e.id and ZONES[e.id]
+            if z then
+                lines[#lines + 1] = string.format('{AAAAAA}trwa {FFFFFF}%s{AAAAAA} | od Ciebie {FFFFFF}%.0f m{AAAAAA}%s',
+                    fmtMin(e.hs), e.hd, teleText(z))
+            else
+                lines[#lines + 1] = string.format('{AAAAAA}trwa {FFFFFF}%s', fmtMin(e.hs))
+            end
+        end
+        if #lines == 0 then lines[1] = '{AAAAAA}HUD ataku na nasze strefy' end
+        enLines, enN, enW = lines, #EN, linesWidth(lines)
+    end
+    hudBox('strefywrog', enLines, enW, 0.30, 0xFFFF3333)
 end
 
 -- ------------------------------------------------------------ /strefy w tle: menu -> "Zobacz wszystkie strefy" -> strony
@@ -5353,18 +5403,16 @@ function M.init()
     logf('Start. BackgroundPlay: ' .. (bg == true and 'ON' or (bg == false and 'OFF (na alt-tabie alerty przyjda po powrocie)' or '?')))
 end
 
-function M.frame()
-    if not A.menuOpen then setupOpen = nil end
-    local tnow = A.now()
+function M.frame(tnow)                            -- tnow = A.now() z petli glownej
     pcall(drawAttackHud, tnow)
     pcall(drawEnemyHud, tnow)
     if BR.state ~= 'idle' or BR.want then
         local okB, errB = pcall(browseStep, tnow)
         if not okB then logf('/strefy: blad ' .. tostring(errB)); BR.state, BR.want = 'idle', false end
     end
+    if tnow < nextStep then return end
+    nextStep = tnow + 0.1
     local clk = os.clock()
-    if clk < nextStep then return end
-    nextStep = clk + 0.1
 
     local now = os.time()
     local gap = now - lastTick
@@ -5435,8 +5483,10 @@ end
 M.setMine = function(id) zset(id, true, gangLabel(), 'bot') end
 
 function M.disable()
-    chatQueue, batch, ATT, EN = {}, {}, {}, {}
+    chatQueue, batch, ATT, EN, carry = {}, {}, {}, {}, nil
     BR.state, BR.want = 'idle', false
+    outbox = {}                                     -- wylaczony: zalegle alerty nie poleca po ponownym wlaczeniu
+    if inflight then A.proc.finish(inflight.proc); inflight = nil end   -- curl konczy sam, uchwyt zamkniety
 end
 
 function M.terminate()
@@ -5451,8 +5501,7 @@ end
 -- ------------------------------------------------------------ menu
 
 function M.menuGroup()
-    local ui, im = A.ui, A.imgui
-    if setupOpen == nil then setupOpen = (C.webhook == '' or C.gang == '') end
+    local ui = A.ui
     ui.check('StrefaAlert', function() return C.discord end, function(v) C.discord = v; save() end,
         'Wysyla na Discorda alerty, gdy ktos atakuje Twoja strefe, gdy ja stracisz albo obronisz.')
     ui.check('HUD ataku', function() return C.attackHud end, function(v) C.attackHud = v; save() end,
@@ -5475,11 +5524,8 @@ function M.menuGroup()
           'Kazda strefa: czyja jest, kiedy mozna ja przejac i najblizszy teleport.' },
     })
     if M.showZones then
-        local ids = {}
-        for id in pairs(ZONES) do ids[#ids + 1] = id end
-        table.sort(ids)
         local t = os.time()
-        for _, id in ipairs(ids) do
+        for _, id in ipairs(ZIDS) do
             local z, st = ZONES[id], ZS[id]
             local txt, col
             if st and st.mine then txt, col = 'nasza', 0xFF33FF66
@@ -11602,11 +11648,11 @@ end)(A))
 
 -- ============================================================================
 -- MODUL: MAKRO (dawny AutoY.ahk) - szybkie wciskanie klawisza (domyslnie Y)
--- Sterowanie tylko klawiszami (domyslnie Lewo / Prawo). Menu: zakladka Strefy.
--- Tempo dobierane samo: wcisniecie i puszczenie trwaja kazde co najmniej jedna
--- klatke i 18 ms - gra czyta klawiature raz na klatke, wiec kazde wcisniecie
--- jest zauwazone, a przy 60-100 FPS to ok. 25-30 wcisniec na sekunde (jak w AHK).
--- Pauza: czat, dialog, menu, menu pauzy, gra bez fokusu.
+-- Sterowanie tylko klawiszami (domyslnie Lewo / Prawo; ten sam klawisz = przelacznik). Menu: zakladka Boty.
+-- Tempo: C.rate wcisniec na sekunde; wcisniecie i puszczenie trwaja po pol okresu (30/s = 16.7 ms),
+-- ale kazde co najmniej jedna klatke - gra czyta klawiature raz na klatke, wiec kazde wcisniecie
+-- jest zauwazone; gorna granica to polowa FPS.
+-- Pauza: czat, dialog, menu, menu pauzy, gra bez fokusu, Gornik / Strefy Bot w akcji.
 -- ============================================================================
 A.register((function(A)
 local ffi = A.ffi
@@ -11624,23 +11670,38 @@ local C = {
 
 -- Stale tempo: kolejne zmiany stanu klawisza sa planowane od poprzedniego terminu (nie od "teraz"),
 -- wiec nie ma dryfu; po przycieciu gry nie ma serii nadrabiajacej; kazdy stan trwa min. 1 pelna klatke
--- (gra czyta klawiature raz na klatke, krotsze stuknicie by zgubila).
+-- (gra czyta klawiature raz na klatke, krotsze stuknicie by zgubila). Zegar: A.hires (QPC).
 local on, down, paused = false, false, false
 local nextFlip, flipFrame, frameNo = 0, -1, 0
-local focused, focusAt = true, 0
-local scan = 0x15
-local font, pid
+local scan, ext, synVk = 0x15, 0, 0x59           -- scancode, flaga EXTENDEDKEY, VK w WM_KEYDOWN
+local SYN = { vk = 0x59, untilT = 0 }            -- A.synth: wlasne wcisniecia nie sa skrotami innych modulow
+local kbd, fgWin, winPid, myPid, pidBuf          -- WinAPI rozwiazane raz (bez closure / ffi.new co klatke)
+local font, hudW
+
+-- lewy/prawy Shift, Ctrl, Alt przychodza w WM_KEYDOWN jako zwykly Shift, Ctrl, Alt
+local VK_GENERIC = { [0xA0] = 0x10, [0xA1] = 0x10, [0xA2] = 0x11, [0xA3] = 0x11, [0xA4] = 0x12, [0xA5] = 0x12 }
 
 local function save() A.saveJson(FILE, C) end
 
+-- klawisze rozszerzone (strzalki, Insert, Delete, Home, End, PgUp/PgDn, prawy Ctrl/Alt) wymagaja flagi
+-- EXTENDEDKEY - bez niej gra dostaje klawisz z bloku numerycznego o tym samym scancode
 local function updScan()
-    local ok, s = pcall(function() return ffi.C.MapVirtualKeyA(C.key, 0) end)   -- MAPVK_VK_TO_VSC
-    s = ok and tonumber(s) or 0
+    local s, e = 0, 0
+    pcall(function()
+        local x = tonumber(ffi.C.MapVirtualKeyA(C.key, 4)) or 0                    -- MAPVK_VK_TO_VSC_EX
+        if A.bit.band(x, 0xFF00) == 0xE000 then
+            s, e = A.bit.band(x, 0xFF), 1
+        else
+            s = tonumber(ffi.C.MapVirtualKeyA(C.key, 0)) or 0                      -- MAPVK_VK_TO_VSC
+        end
+    end)
+    ext = e
     scan = s ~= 0 and s or 0x15
+    synVk = VK_GENERIC[C.key] or C.key
 end
 
 local function key(up)
-    pcall(function() ffi.C.keybd_event(0, scan, up and 0x000A or 0x0008, 0) end)   -- SCANCODE (+KEYUP)
+    if kbd then pcall(kbd, 0, scan, (up and 0x000A or 0x0008) + ext, 0) end    -- SCANCODE (+KEYUP) (+EXTENDEDKEY)
 end
 
 local function release()
@@ -11652,21 +11713,17 @@ end
 
 -- okno na pierwszym planie nalezy do procesu gry
 local function gameFocused()
-    local ok, r = pcall(function()
-        if not pid then pid = ffi.C.GetCurrentProcessId() end
-        local h = ffi.C.GetForegroundWindow()
-        if h == nil then return false end
-        local p = ffi.new('uint32_t[1]')
-        ffi.C.GetWindowThreadProcessId(h, p)
-        return p[0] == pid
-    end)
-    return not ok or r
+    if not pidBuf then return A.gameFocused() end
+    local h = fgWin()
+    if h == nil then return false end
+    winPid(h, pidBuf)
+    return pidBuf[0] == myPid
 end
 
 local function set(v)
     on = v and true or false
     if not on then release() end
-    nextFlip, focusAt = 0, 0
+    nextFlip = 0
 end
 
 function M.init()
@@ -11679,6 +11736,15 @@ function M.init()
         if type(t.rate) == 'number' then C.rate = A.clamp(math.floor(t.rate), 5, 60) end
     end
     save()
+    local okK, fk = pcall(function() return ffi.C.keybd_event end)
+    kbd = okK and fk or nil
+    local okF, fw, fp, me, buf = pcall(function()
+        local fwin, fpid, b = ffi.C.GetForegroundWindow, ffi.C.GetWindowThreadProcessId, ffi.new('uint32_t[1]')
+        local h = fwin()
+        if h ~= nil then fpid(h, b) end                  -- proba: typy argumentow pasuja (inaczej A.gameFocused)
+        return fwin, fpid, ffi.C.GetCurrentProcessId(), b
+    end)
+    if okF then fgWin, winPid, myPid, pidBuf = fw, fp, me, buf end
     updScan()
     font = renderCreateFont('Arial', 9, 5)
 end
@@ -11686,34 +11752,40 @@ end
 function M.onKey(vk)
     if vk ~= C.keyOn and vk ~= C.keyOff then return end
     if A.chatInputActive() or A.dialogActive() then return end
-    set(vk == C.keyOn)
+    if C.keyOn == C.keyOff then set(not on) else set(vk == C.keyOn) end
 end
 
 function M.frame(now)
     frameNo = frameNo + 1
     if on then
-        if now >= focusAt then focusAt, focused = now + 0.25, gameFocused() end
-        paused = A.menuOpen or A.miningBusy or A.minerAuto or A.zoneBotOn or A.pauseActive() or A.chatInputActive()
-            or A.dialogActive() or not focused
+        -- fokus co klatke (dwa tanie wywolania WinAPI): po alt-tabie (BackgroundPlay) zadne wcisniecie nie trafi do innego okna
+        paused = A.menuOpen or A.miningBusy or A.minerAuto or A.zoneBotOn or not gameFocused() or A.pauseActive()
+            or A.chatInputActive() or A.dialogActive()
         if paused then
             release()
             nextFlip = 0
         else
+            local t = A.hires()
             local phase = 0.5 / C.rate
-            if nextFlip == 0 then nextFlip = now end
-            if now >= nextFlip and frameNo > flipFrame then
+            if nextFlip == 0 or nextFlip - t > 1 then nextFlip = t end
+            if t >= nextFlip and frameNo > flipFrame then
                 down = not down
+                -- oznaczone dla rdzenia (nie skrot), chyba ze to tez Wlacz/Wylacz - wtedy jak dawniej
+                if down and C.key ~= C.keyOn and C.key ~= C.keyOff then
+                    SYN.vk, SYN.untilT = synVk, now + 0.08
+                    A.synth = SYN
+                end
                 key(not down)
                 flipFrame = frameNo
                 nextFlip = nextFlip + phase
-                if now - nextFlip > phase then nextFlip = now + phase end   -- po przycieciu: bez serii nadrabiania
+                if t - nextFlip > phase then nextFlip = t + phase end   -- po przycieciu: bez serii nadrabiania
             end
         end
     end
     if C.hud and A.drawOk and font and (on or A.menuOpen) then
-        local w = renderGetFontDrawTextLength(font, 'Makro')
-        local x, y = A.hudPlace('autoy', w + 14, 18, 0.47, 0.02)
-        renderDrawBox(x, y, w + 14, 18, 0x90000000)
+        hudW = hudW or renderGetFontDrawTextLength(font, 'Makro') + 14
+        local x, y = A.hudPlace('autoy', hudW, 18, 0.47, 0.02)
+        renderDrawBox(x, y, hudW, 18, 0x90000000)
         renderDrawBox(x, y, 3, 18, not on and 0xFF666666 or (paused and 0xFFFFD24A or 0xFF33FF66))
         renderFontDrawText(font, 'Makro', x + 8, y + 2, 0xFFFFFFFF)
     end
@@ -11722,7 +11794,7 @@ end
 function M.disable() set(false) end
 function M.terminate() release() end
 
--- grupa w zakladce Strefy
+-- grupa w zakladce Boty
 function M.menuGroup()
     local ui = A.ui
     ui.keyButton('Wlacz', function() return C.keyOn end, function(vk) C.keyOn = vk; save() end,
