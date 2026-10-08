@@ -14852,10 +14852,12 @@ local MODIFIER_VK = { [0x10] = true, [0x11] = true, [0x12] = true, [0x5B] = true
     [0xA0] = true, [0xA1] = true, [0xA2] = true, [0xA3] = true, [0xA4] = true, [0xA5] = true }
 
 addEventHandler('onWindowMessage', function(msg, wparam, lparam)
-    -- klawisz wcisniety przez bota (gornik): nie jest skrotem dla zadnego modulu
+    -- klawisz wcisniety przez bota (gornik, gang bot): nie jest skrotem dla zadnego modulu. Zjadany przy pierwszym
+    -- trafieniu, z zapasem 0.5 s ponad untilT - przy klatce dluzszej niz 80 ms komunikat przychodzi juz po untilT
     local sy = A.synth
     if sy and ((msg == 0x020A and sy.vk == 'wheel') or ((msg == 0x0100 or msg == 0x0104) and wparam == sy.vk))
-        and A.now() < sy.untilT then
+        and A.now() < sy.untilT + 0.5 then
+        A.synth = nil
         return
     end
     if msg == 0x020A then                                          -- WM_MOUSEWHEEL
