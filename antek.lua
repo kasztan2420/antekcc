@@ -715,6 +715,7 @@ end -- ffi
 do
 local workers = {}
 A.restarts = 0
+A.frameNo = 0          -- licznik klatek petli main
 
 -- modId: watek modulu - gdy modul jest wylaczony, watek tylko spi (zero logiki w tle)
 function A.worker(name, body, modId)
@@ -722,10 +723,13 @@ function A.worker(name, body, modId)
     w.th = lua_thread.create(function()
         while true do
             while modId and A.cfg.modules[modId] == false do wait(250) end
+            local f0 = A.frameNo
             local ok, err = pcall(body)
             if not ok then
                 A.log('antek.cc', 'blad w watku ' .. name .. ': ' .. tostring(err))
                 wait(1000)
+            elseif A.frameNo == f0 then
+                wait(0)        -- przebieg bez zadnego wait (np. wczesny return) - inaczej petla zamrozi gre
             end
         end
     end)
@@ -14949,6 +14953,7 @@ function main()
     local nextRes, nextSup = 0, 0
     while true do
         wait(0)
+        A.frameNo = A.frameNo + 1
         local now = A.now()
         if now >= nextSup then
             nextSup = now + 0.5
