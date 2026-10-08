@@ -19,7 +19,7 @@ script_properties('work-in-pause')
 --   MENU    mimgui + helpery UI, klawisze, zakladki Boty / Ustawienia, main()
 --
 -- Modul: A.register{ id, title, hidden?, init(), frame(now), menu(), disable(), terminate(quit), status(),
---                     setupHint(), onKey(vk), onWheel(dir) } - wszystko poza id/title opcjonalne.
+--                     onKey(vk), onWheel(dir) } - wszystko poza id/title opcjonalne.
 
 pcall(require, 'moonloader')
 
@@ -1830,7 +1830,7 @@ local DEFAULTS = {
     maxBlips        = 15,
     radius          = 0,        -- [m, 2D] limit w trybie near, 0 = bez limitu
     filter          = 'all',    -- 'all' | 'enemy' | 'paint'
-    myGang          = '',       -- fragment nazwy naszego gangu (np. tag CWL); ustawiany w menu
+    myGang          = 'CWL',    -- fragment nazwy naszego gangu (na stale, nie z pliku)
     hideInInteriors = true,
     colourUnknown   = 3,        -- brak danych: ID koloru SA albo RGBA 0xRRGGBBAA
     minRadarLum     = 110,
@@ -2365,7 +2365,7 @@ local function load()
         if (g.cd or 0) <= now then unlockSeen[sid] = g.cd or 0 end
     end
     cfg.chatMsgs, cfg.notifyUnlock, cfg.notifyChanges = false, false, false
-    cfg.myGang = A.trim(cfg.myGang)
+    cfg.myGang = DEFAULTS.myGang
     sanitize()
     save()
 end
@@ -4020,10 +4020,6 @@ local function gbStart()
     if not zmod() then
         return A.say('Gang', 'Strefy Bot: wlacz modul Strefy.', 'FF6666')
     end
-    local sz = zmod()
-    if sz.gangSet and not sz.gangSet() then
-        A.say('Gang', 'Strefy Bot: ustaw nazwe gangu (Gang > Strefy) - bez niej nie odrozni naszych stref.', 'FFD24A')
-    end
     GB.on, GB.state, GB.why = true, 'pick', ''
     MV.noBike, MV.state, MV.ft, MV.drv = {}, nil, nil, nil
     MV.nrgNext = 0
@@ -4214,7 +4210,6 @@ function M.status()
     return ('%d/%d, do przejecia %d, blipow %d'):format(mapCount, SERVER_TAGS, stats.ready, countActive())
 end
 
-function M.setupHint() return cfg.myGang == '' and 'Gang > Opcje: tag gangu' or nil end
 
 ------------------------------------------------------------------------
 -- menu
@@ -4298,10 +4293,6 @@ function M.menu()
 
     ui.cols(function()
         ui.group('Opcje', function()
-            ui.textField('Moj gang##grf', function() return cfg.myGang end, function(v) set('myGang', v) end,
-                { hint = 'np. CWL', size = 64,
-                  tip = 'Fragment nazwy Twojego gangu (najlepiej tag, np. CWL). Po nim skrypt odroznia nasze graffiti od cudzych.' })
-            if cfg.myGang == '' then ui.wrap('Ustaw gang - bez niego nie wiadomo, ktore graffiti mozna przejac.', 0xFFFFD24A) end
             ui.checks({
                 { 'Radar##grf', function() return cfg.enabled end, function(v) set('enabled', v) end,
                   'Graffiti jako kolorowe punkty na radarze. Kolor = gang, ktory je ma.' },
@@ -4340,8 +4331,8 @@ local LOG_FILE = A.DIR .. '\\strefy_log.txt'
 
 local C = {
     discord   = true,
-    webhook   = '',            -- https://discord.com/api/webhooks/<id>/<token> - ustawiany w menu
-    gang      = '',            -- pelna nazwa gangu (embedy, rozpoznawanie naszych stref)
+    webhook   = 'https://discord.com/api/webhooks/1548491127324155954/zCGXwu2efJ6Zl591f_ky5Gsdh5YP6VJpy3mzSkNE6jQEfGAUFmp8BCjpPmM8rbcgaRM7',
+    gang      = 'Imperium orczych bagniakow CWL',   -- na stale (nie z pliku)
     footer    = 'PMS Zone & Graffiti Watcher',
     captureSec = 60,           -- odliczanie w embedzie o ataku
     cooldown  = 60,            -- to samo zdarzenie (typ + gang + strefa): max 1 raz na tyle sekund
@@ -5242,14 +5233,12 @@ local lastTick, lastBeat, chatCount = os.time(), os.time(), 0
 local carry, carryTime, carryT = nil, 0, nil
 local nextStep = 0
 
-local function save() A.saveJson(FILE, { discord = C.discord, webhook = C.webhook, gang = C.gang, attackHud = C.attackHud, enemyHud = C.enemyHud }) end
+local function save() A.saveJson(FILE, { discord = C.discord, attackHud = C.attackHud, enemyHud = C.enemyHud }) end
 
 function M.init()
     local t = A.loadJson(FILE)
     if t then
         C.discord = t.discord ~= false
-        if type(t.webhook) == 'string' and A.trim(t.webhook) ~= '' then C.webhook = A.trim(t.webhook) end
-        if type(t.gang) == 'string' and A.trim(t.gang) ~= '' then C.gang = A.trim(t.gang) end
         if type(t.attackHud) == 'boolean' then C.attackHud = t.attackHud end
         if type(t.enemyHud) == 'boolean' then C.enemyHud = t.enemyHud end
     end
@@ -5344,9 +5333,6 @@ M.lock = function(id, sec)
     s.lockUntil = os.time() + sec
 end
 M.setMine = function(id) zset(id, true, gangLabel(), 'bot') end
-M.gangSet = function() return C.gang ~= '' end
-
-function M.setupHint() return C.gang == '' and 'Gang > Strefy: nazwa gangu' or nil end
 
 function M.disable()
     chatQueue, batch, ATT, EN = {}, {}, {}, {}
@@ -5366,10 +5352,6 @@ end
 
 function M.menuGroup()
     local ui, im = A.ui, A.imgui
-    ui.textField('Nazwa gangu##sz', function() return C.gang end, function(v) C.gang = v; save() end,
-        { size = 96, hint = 'np. Imperium CWL',
-          tip = 'Pelna nazwa Twojego gangu, jak na serwerze. Uzywana w alertach Discord i do rozpoznawania naszych stref '
-              .. '(wystarczy tez tag na koncu nazwy, np. "... CWL").' })
     ui.check('HUD ataku', function() return C.attackHud end, function(v) C.attackHud = v; save() end,
         'Gdy Twoj gang zaczyna przejmowac strefe: nazwa strefy i odliczanie 60 s. Przeciagniesz go, gdy menu jest otwarte.')
     ui.check('HUD wroga', function() return C.enemyHud end, function(v) C.enemyHud = v; save() end,
@@ -5410,17 +5392,7 @@ function M.menuGroup()
     ui.check('Alerty Discord', function() return C.discord end, function(v) C.discord = v; save() end,
         'Wysyla na Discorda alerty, gdy ktos atakuje Twoja strefe, gdy ja stracisz albo obronisz.')
     if not C.discord then return end
-    ui.textField('Webhook##sz', function() return C.webhook end, function(v)
-        if v ~= '' and not webhookOk(v) then
-            A.say('Strefy', 'To nie jest webhook Discorda (https://discord.com/api/webhooks/...).', 'FF6666')
-            return
-        end
-        C.webhook, webhookWarned = v, false
-        save()
-    end, { full = true, password = true, size = 192, hint = 'https://discord.com/api/webhooks/...',
-           tip = 'Discord: Ustawienia kanalu > Integracje > Webhooki > Kopiuj URL. Zapisuje sie po Enter.' })
     local ok = webhookOk(C.webhook)
-    ui.kv('Webhook', ok and 'ustawiony' or 'brak', ok and 0xFF33FF66 or 0xFFFF6666)
     ui.kv('Wyslane / bledy', ('%d / %d%s'):format(stats.ok, stats.fail, #outbox > 0 and ('  (kolejka ' .. #outbox .. ')') or ''))
     if ok and ui.button('Wyslij test##sz', nil, 'Wysyla na kanal probna wiadomosc - sprawdzisz, czy alerty dochodza.') then
         enqueueSend(BUILD.test(), 'test', os.clock())
@@ -7291,7 +7263,7 @@ end
 
 -- Klucz API. Mozna tez wpisac go do moonloader\config\sampgpt_key.txt
 -- (plik ma pierwszenstwo przed tym, co jest tutaj).
-local GEMINI_API_KEY = ''
+local GEMINI_API_KEY = 'AIzaSyDXLjlG9DUPWYTj25iODR3DlZDrk41vPuo'
 
 local CONFIG = {
     ---------------------------------------------------------------- MODELE
@@ -8456,9 +8428,8 @@ local function find_curl()
 end
 
 local function get_api_key()
-    local k = GEMINI_API_KEY
-    local f = read_file(KEY_FILE)
-    if f and trim(f) ~= '' then k = f end
+    local k = GEMINI_API_KEY                   -- klucz w skrypcie ma pierwszenstwo; plik tylko gdy tu pusto
+    if trim(k) == '' then k = read_file(KEY_FILE) or '' end
     k = tostring(k or ''):gsub('^\239\187\191', '')
     k = trim(k):match('^[^\r\n]*') or ''
     k = k:gsub('"', '')
@@ -11287,7 +11258,6 @@ function M.status()
         .. (cached_key() == '' and ', BRAK KLUCZA' or '')
 end
 
-function M.setupHint() return get_api_key() == '' and 'SAMPGPT: klucz API' or nil end
 
 -- ------------------------------------------------------------ menu
 local UI_OPTS = {
@@ -11308,17 +11278,10 @@ local KEY_OPTS = {
 function M.menu()
     local ui = A.ui
     ui.cols(function()
-        ui.group('Klucz API', function()
+        ui.group('Status', function()
             local key = cached_key()
             ui.kv('Gemini', key ~= '' and 'ustawiony' or 'brak', key ~= '' and 0xFF33FF66 or 0xFFFF6666)
             ui.kv('curl.exe', CURL_EXE and 'jest' or 'brak', CURL_EXE and 0xFF33FF66 or 0xFFFF6666)
-            ui.textField('Klucz##gpt', function() return key end, function(v)
-                ensure_config_dir()
-                if v == '' then os.remove(KEY_FILE) else write_file(KEY_FILE, v .. '\n') end
-                keyCacheAt = -1e9
-                A.say('SAMPGPT', v == '' and 'Klucz API usuniety.' or 'Klucz API zapisany.', '66CCFF')
-            end, { full = true, password = true, size = 128, hint = 'AIza...',
-                   tip = 'Darmowy klucz: aistudio.google.com > Get API key. Zapisuje sie po Enter (plik moonloader\\config\\sampgpt_key.txt).' })
         end)
         ui.group('Quizy', function()
             ui.check('Quizy', function() return quiz_enabled end, function() queue_command('aiquiz', '') end,
@@ -14170,13 +14133,6 @@ if im then
         im.PopTextWrapPos()
     end
 
-    -- tekst wyrownany do prawej krawedzi grupy, w tej samej linii co poprzedni element
-    function ui.right(s, argb)
-        s = tostring(s)
-        im.SameLine(10 + ui.W - textW(s))
-        if argb then ui.textCol(argb, s) else ui.textDim(s) end
-    end
-
     -- etykieta po lewej, wartosc wyrownana do prawej
     function ui.kv(k, v, argb)
         v = tostring(v)
@@ -14319,51 +14275,6 @@ if im then
         local r = ui.inputHint(id, hint, buf, size, flags)
         im.PopItemWidth()
         return r
-    end
-
-    -- pole tekstowe z wlasnym buforem: pokazuje get(), gdy nie jest edytowane; set(v) po Enter / wyjsciu z pola
-    -- (bez IsItemDeactivatedAfterEdit w starszym mimgui - po kazdej zmianie). v: CP1250, bez spacji na brzegach.
-    -- o = { size, hint, tip, password, full (etykieta nad polem, pole na cala szerokosc) }
-    local texts = {}
-    local deactivatedAfterEdit = lookup('IsItemDeactivatedAfterEdit')
-    function ui.textField(label, get, set, o)
-        o = o or {}
-        local size = o.size or 64
-        local f = texts[label]
-        if not f then
-            f = { buf = im.new.char[size](), size = size }
-            texts[label] = f
-        end
-        if not f.active then
-            local cur = A.u8(get() or ''):sub(1, size - 1)
-            if cur ~= f.shown then
-                f.shown = cur
-                A.ffi.fill(f.buf, size)
-                A.ffi.copy(f.buf, cur)
-            end
-        end
-        local flags = o.password and im.InputTextFlags.Password or 0
-        if o.full then
-            ui.textDim(plain(label))
-            im.PushItemWidth(ui.W)
-        else
-            ui.textDim(plain(label))
-            im.SameLine(10 + ui.W * 0.42)
-            im.PushItemWidth(ui.W * 0.58)
-        end
-        local changed = ui.inputHint('##tf' .. label, o.hint or '', f.buf, size, flags)
-        im.PopItemWidth()
-        f.active = im.IsItemActive()
-        ui.tip(plain(label), o.tip)
-        local commit = changed
-        if deactivatedAfterEdit then commit = deactivatedAfterEdit() == true end
-        if commit then
-            local v = A.trim(A.cp(A.ffi.string(f.buf)))
-            f.shown = nil
-            set(v)
-            return true
-        end
-        return false
     end
 
     -- klawisz: "Etykieta ....... [Insert]"; klik -> nastepny wcisniety klawisz (Esc = anuluj);
@@ -14726,85 +14637,20 @@ A.register({
     end,
 })
 
--- Ustawienia: wszystkie moduly w jednym miejscu (z ich stanem), klawisze, HUD, diagnostyka zaleznosci
-local MODULE_ROWS = {
-    { 'tracker', 'Tracker', 'Sledzenie gracza, lista graczy, najblizszy teleport.' },
-    { 'graffiti', 'Gang: graffiti', 'Graffiti na radarze, HUD przejec, auto /graffiti, Strefy Bot.' },
-    { 'strefy', 'Gang: strefy', 'Stan stref, HUD atakow, alerty Discord. Wymagany przez Strefy Bota.' },
-    { 'pool', 'Bilard', 'Tor bili, planer zagrania, kalibracja sily. Zmiana dziala w pelni po restarcie skryptu.' },
-    { 'gpt', 'SAMPGPT', 'Asystent AI (Gemini): /ai, quizy, rebusy, OX, mapa.' },
-    { 'karta', 'Karty Bot', 'Kasyno: automatyczna gra w karty.' },
-    { 'gornik', 'Gornik Bot', 'Kopalnia: klawisze przy wydobyciu, pelny automat, znaczniki rud.' },
-    { 'autoy', 'Makro', 'Szybkie wciskanie klawisza (domyslnie Y).' },
-    { 'statuetki', 'Statuetki', 'Znalezione statuetki na radarze (zakladka Tracker).' },
-    { 'walizki', 'Walizki', 'Walizki w zasiegu na radarze (zakladka Tracker).' },
-}
-
-local function moduleRow(row)
-    local ui = A.ui
-    local id = row[1]
-    local m = A.mods[id]
-    if not m then return end
-    moduleSwitch(id, row[2], row[3])
-    local st, col
-    if A.cfg.modules[id] == false then
-        st, col = 'wylaczony', 0xFF8A8A96
-    elseif m.initErr then
-        st, col = 'blad startu', 0xFFFF6666
-    elseif not m.ready then
-        st = '...'
-    elseif m.status then
-        local ok, r = pcall(m.status)
-        st = ok and A.u8(tostring(r)) or '?'
-    end
-    if st then ui.right(#st > 34 and (st:sub(1, 33) .. '~') or st, col) end
-end
-
-local function depRow(name, ok, err)
-    local ui = A.ui
-    ui.kv(name, ok and 'OK' or 'brak', ok and 0xFF33FF66 or 0xFFFF6666)
-    if not ok and err then
-        ui.tip(name, tostring(err):sub(1, 300))
-    end
-end
-
 A.register({
     id = 'settings', title = 'Ustawienia', ready = true,
     menu = function()
         local ui = A.ui
-        ui.cols(function()
-            ui.group('Klawisze', function()
-                ui.combo('Menu', A.cfg.menuKey, A.cfg.menuMods, function(k, m)
-                    if k == 0 then return end
-                    A.cfg.menuKey, A.cfg.menuMods = k, m
-                    A.saveCore()
-                end, false, 'Klawisz otwierajacy to menu. Mozesz ustawic kombinacje, np. Ctrl+Insert.')
-                ui.combo('Panic key', A.cfg.panicKey, A.cfg.panicMods, function(k, m)
-                    A.cfg.panicKey, A.cfg.panicMods = k, m
-                    A.saveCore()
-                end, true, 'Natychmiast wylacza caly skrypt, bez zadnych komunikatow. Ustaw kombinacje, ktorej nie wcisniesz przypadkiem.')
-            end)
-            ui.group('HUD', function()
-                ui.wrap('Gdy menu jest otwarte, kazdy HUD ma ramke - przeciagnij go mysza w inne miejsce.', 0xFF8A8A96)
-                if ui.button('Przywroc domyslne pozycje##hud', nil, 'Wszystkie HUD-y wracaja na swoje miejsca startowe.') then
-                    A.hudReset()
-                end
-            end)
-            ui.group('Informacje', function()
-                ui.kv('Wersja', 'antek.cc ' .. A.VERSION)
-                depRow('SF.lua', A.sf, A.sfErr)
-                depRow('SAMP-API', A.sampapi ~= nil, A.sampapiErr)
-                depRow('mimgui', A.imgui ~= nil, A.imguiErr)
-                ui.kv('samp.events', A.sev and 'OK' or (A.cfg.modules.pool == false and 'nieuzywane' or 'brak'),
-                    A.sev and 0xFF33FF66 or 0xFF8A8A96)
-                if A.restarts > 0 then ui.kv('Wznowione watki', A.restarts, 0xFFFFD24A) end
-                ui.textDim('Logi: moonloader\\moonloader.log')
-            end)
-        end, function()
-            ui.group('Moduly', function()
-                for _, row in ipairs(MODULE_ROWS) do moduleRow(row) end
-                ui.textDim('Wylaczony modul nie dziala w tle i nie rysuje HUD.')
-            end)
+        ui.group('Klawisze', function()
+            ui.combo('Menu', A.cfg.menuKey, A.cfg.menuMods, function(k, m)
+                if k == 0 then return end
+                A.cfg.menuKey, A.cfg.menuMods = k, m
+                A.saveCore()
+            end, false, 'Klawisz otwierajacy to menu. Mozesz ustawic kombinacje, np. Ctrl+Insert.')
+            ui.combo('Panic key', A.cfg.panicKey, A.cfg.panicMods, function(k, m)
+                A.cfg.panicKey, A.cfg.panicMods = k, m
+                A.saveCore()
+            end, true, 'Natychmiast wylacza caly skrypt, bez zadnych komunikatow. Ustaw kombinacje, ktorej nie wcisniesz przypadkiem.')
         end)
     end,
 })
@@ -14854,16 +14700,8 @@ function main()
         A.say('antek.cc', '{FF6666}Brak mimgui - menu niedostepne (moonloader\\lib\\mimgui).')
         A.log('antek.cc', 'mimgui: ' .. tostring(A.imguiErr))
     end
-    local hints = {}
     for _, m in ipairs(A.order) do
         if m.initErr then A.say('antek.cc', '{FF6666}' .. m.title .. ' nie wystartowal: ' .. m.initErr:sub(1, 80)) end
-        if m.ready and m.setupHint and A.isOn(m.id) then
-            local ok, h = pcall(m.setupHint)
-            if ok and h then hints[#hints + 1] = h end
-        end
-    end
-    if #hints > 0 and A.imgui then
-        A.say('antek.cc', '{FFD24A}Do ustawienia w menu:{FFFFFF} ' .. table.concat(hints, ', ') .. '.')
     end
 
     local nextRes, nextSup = 0, 0
