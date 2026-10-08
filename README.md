@@ -1,0 +1,89 @@
+# antek.cc
+
+Skrypt MoonLoadera dla GTA San Andreas Multiplayer: kilka narzędzi w jednym menu (mimgui).
+Jeden plik, `antek.lua`, w 100% ASCII — kodowanie pliku nie ma znaczenia dla MoonLoadera.
+
+## Moduły
+
+| Zakładka | Moduł | Co robi |
+|---|---|---|
+| Tracker | Tracker | Śledzenie gracza (stream / synchronizacja / marker), dystans, kierunek, najbliższy teleport serwera |
+| | Statuetki | Znalezione statuetki (pickup 1276) na radarze, zapis do `pickupy_dump.txt` |
+| | Walizki | Walizki (model 19624) w zasięgu na radarze; podniesiona znika |
+| Gang | Graffiti | Graffiti na radarze w kolorze gangu, HUD przejęć, auto `/graffiti` w tle |
+| | Strefy | Stan stref (`/strefy` + czat), HUD ataku i HUD wroga, alerty Discord |
+| | Strefy Bot | Dojazd na checkpoint strefy (NRG-500 albo pieszo), `Y`, przejęcie, następna |
+| Boty | Karty Bot | Kasyno: automatyczna gra w karty |
+| | Górnik Bot | Klawisze przy wydobyciu, pełny automat (bieg do rud, sprzedaż), znaczniki rud |
+| | Makro | Szybkie wciskanie klawisza (domyślnie `Y`) |
+| Bilard | Bilard | Tor bili, odbicia, łuzy, zalecana siła, planer zagrania, kalibracja |
+| SAMPGPT | SAMPGPT | Asystent AI (Gemini): `/ai`, quizy i rebusy z czatu/ekranu, OX, mapa z pamięci gry |
+| Ustawienia | — | Klawisz menu, panic key, włączanie modułów, reset HUD-ów, stan zależności |
+
+## Wymagania
+
+- GTA San Andreas + SA-MP 0.3.7 i MoonLoader
+- `moonloader/lib`: **SF.lua**, **SAMP-API** (`sampapi`), **mimgui**
+- opcjonalnie: `lib.samp.events` (Bilard: pasek siły bez odczytu textdrawów), `memory` (Bilard: obrót stołu z macierzy), `encoding` (SAMPGPT: polskie znaki w zapytaniach)
+- SAMPGPT i alerty Discord: `curl.exe` (Windows 10+ ma go w `System32`; alerty mają też zapas przez PowerShell)
+- Strefy w tle po alt-tabie: `BackgroundPlay.lua`
+
+## Instalacja
+
+1. Skopiuj `antek.lua` do folderu `moonloader`.
+2. Uruchom grę, wejdź na serwer, naciśnij **Insert**.
+3. Przy pierwszym starcie skrypt napisze na czacie, co jest do ustawienia:
+   - **Gang → Opcje → Mój gang** — tag gangu (np. `CWL`), po nim skrypt odróżnia nasze graffiti,
+   - **Gang → Strefy → Nazwa gangu** — pełna nazwa gangu (alerty, nasze strefy, Strefy Bot),
+   - **Gang → Strefy → Webhook** — opcjonalnie, alerty o strefach na Discorda (przycisk *Wyślij test*),
+   - **SAMPGPT → Klucz API** — opcjonalnie, darmowy klucz z [aistudio.google.com](https://aistudio.google.com).
+
+Nie używasz któregoś modułu? Wyłącz go w **Ustawienia → Moduły** — wyłączony nie działa w tle i nie rysuje HUD.
+
+Stare ustawienia (`TagBlips.json`, `pooltracer.lua`, `PlayerTracker_*.txt`) są importowane automatycznie przy pierwszym starcie.
+
+## Klawisze domyślne
+
+Wszystkie zmienisz w menu.
+
+| Klawisz | Akcja |
+|---|---|
+| `Insert` | menu |
+| — | panic key: natychmiast wyłącza cały skrypt (ustaw w Ustawieniach) |
+| `F2` | Strefy Bot start / stop |
+| `F8` | Górnik Bot start / stop (uwaga: to też klawisz screenshota SA-MP) |
+| `F9` | Karty Bot start / stop |
+| `←` / `→` | Makro włącz / wyłącz |
+| `F10` / `F11` / `F12` | SAMPGPT: mapa / wpisz ostatnią odpowiedź / OX z ekranu |
+| `/ai <pytanie>` | SAMPGPT na czacie |
+
+HUD-y przeciągasz myszą, gdy menu jest otwarte.
+
+## Pliki
+
+| Ścieżka | Zawartość |
+|---|---|
+| `moonloader/config/antek/antek.json` | menu, klawisze, moduły, pozycje HUD |
+| `moonloader/config/antek/*.json` | ustawienia modułów (`graffiti`, `strefy`, `tracker`, `gornik`, `rudy`, `karta`, `autoy`, `statuetki`, `walizki`) |
+| `moonloader/config/antek/pool.lua` | kalibracja bilarda |
+| `moonloader/config/antek/strefy_log.txt` | log alertów stref (rotacja przy 1 MB) |
+| `moonloader/config/sampgpt_*.txt` | SAMPGPT: klucz, ustawienia, baza odpowiedzi, wiedza o serwerze, statystyki |
+| `moonloader/pickupy_dump.txt`, `walizki_dump.txt` | znalezione statuetki / walizki |
+| `moonloader/moonloader.log` | diagnostyka wszystkich modułów |
+
+Klucz API i webhook są tylko w tych plikach na Twoim dysku — nie udostępniaj folderu `config`.
+Uszkodzony plik JSON jest odkładany jako `.bak`, a moduł startuje z ustawieniami domyślnymi.
+
+## Rozwój
+
+```sh
+luarocks install luacheck
+luacheck antek.lua tests/     # konfiguracja: .luacheckrc
+luajit tests/run.lua          # testy bez gry: atrapy API MoonLoadera i mimgui
+```
+
+`tests/run.lua` ładuje cały skrypt pod czystym LuaJIT i sprawdza m.in. JSON, kodowanie CP1250 ↔ UTF-8,
+parsery stref, zapis konfiguracji, `init()` / `frame()` wszystkich modułów oraz render i kliknięcia
+każdej zakładki menu.
+
+Nowy moduł: `A.register{ id, title, init, frame, menu, ... }` — opis kontraktu na początku `antek.lua`.
