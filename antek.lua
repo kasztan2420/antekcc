@@ -1797,7 +1797,7 @@ local LABEL_MATCH_RADIUS = 3.0
 local HUD_PAD            = 4
 local BLIP_DISPLAY_BLIP_ONLY = 2
 local SAVE_INTERVAL      = 10
-local LOG_MAX            = 30
+local LABEL_CHUNK        = 256    -- id labeli 3D na klatke (pelny skan = 8 klatek zamiast 2048 wywolan w jednej)
 
 local FILE     = A.DIR .. '\\graffiti.json'
 local OLD_FILE = A.WD .. '\\config\\TagBlips.json'
@@ -1851,7 +1851,6 @@ local targetIdx
 local dirty, saveDirty, poolWarned = true, false, false
 local lastDialogText
 local font
-local events = {}                        -- ostatnie komunikaty (menu)
 
 ------------------------------------------------------------------------
 -- util
@@ -1931,18 +1930,7 @@ local function sampReady()
     return A.ready and type(isSampAvailable) == 'function' and A.sampReady()
 end
 
-local function chatBlocked()
-    local ok, r = pcall(function() return sampIsChatInputActive() or sampIsDialogActive() end)
-    return ok and r
-end
-
-local function pushEvent(text)
-    events[#events + 1] = os.date('%H:%M:%S ') .. text
-    if #events > LOG_MAX then table.remove(events, 1) end
-end
-
 local function notify(text)
-    pushEvent(text)
     A.log('graffiti', stripColors(text))
     if cfg.chatMsgs then A.say('Graffiti', text, '7FD07F') end
 end
@@ -2110,25 +2098,46 @@ local function parseLabel(text)
     }
 end
 
-local function scanLabels()
-    if not sampReady() or type(sampIs3dTextDefined) ~= 'function' then return end
-    local ok, err = pcall(function()
-        for i = 0, MAX_LABELS - 1 do
-            if sampIs3dTextDefined(i) then
-                local text, _, x, y, z = sampGet3dTextInfoById(i)
-                if text and x and text:find(LABEL_PREFIX, 1, true) then
-                    local info = parseLabel(text)
-                    if info and info.sid < SERVER_TAGS then
+local labelCache = {}                    -- id labela -> { text, info }: ten sam tekst = bez ponownego parsowania
+local labelNext = MAX_LABELS             -- kursor skanu labeli (MAX_LABELS = skan nie trwa)
+
+local function scanLabelRange(i0, i1)
+    for i = i0, i1 do
+        if sampIs3dTextDefined(i) then
+            local text, _, x, y, z = sampGet3dTextInfoById(i)
+            if text and x and text:find(LABEL_PREFIX, 1, true) then
+                local c = labelCache[i]
+                if not c or c.text ~= text then
+                    c = { text = text, info = parseLabel(text) }
+                    labelCache[i] = c
+                end
+                local info = c.info
+                if info and info.sid < SERVER_TAGS then
+                    -- label przy znanym graffiti tego ID: mapowanie juz jest (graffiti sa >12 m od siebie,
+                    -- wiec to i tak najblizsze) - bez petli po 100 graffiti dla kazdego labela
+                    local t = TAGS[tagOf[info.sid] or 0]
+                    if not (t and (t[1] - x) ^ 2 + (t[2] - y) ^ 2 + (t[3] - z) ^ 2 <= LABEL_MATCH_RADIUS ^ 2) then
                         local idx, d = nearestTagIdx(x, y, z)
                         if d <= LABEL_MATCH_RADIUS then learnMap(idx, info.sid) end
-                        setGang(info.sid, info.owner, info.rgb, info.cd, info.cdp, info.zone)
                     end
+                    setGang(info.sid, info.owner, info.rgb, info.cd, info.cdp, info.zone)
                 end
             end
         end
-    end)
-    if not ok then A.log('graffiti', 'labele: ' .. tostring(err)) end
-    flushChanges()
+    end
+end
+
+-- skan po kawalku (LABEL_CHUNK id na klatke); po calym przebiegu (albo bledzie) flushChanges
+local function scanLabels()
+    if not sampReady() or type(sampIs3dTextDefined) ~= 'function' then labelNext = MAX_LABELS; return end
+    local i1 = min(labelNext + LABEL_CHUNK, MAX_LABELS) - 1
+    local ok, err = pcall(scanLabelRange, labelNext, i1)
+    labelNext = i1 + 1
+    if not ok then
+        A.log('graffiti', 'labele: ' .. tostring(err))
+        labelNext = MAX_LABELS
+    end
+    if labelNext >= MAX_LABELS then flushChanges() end
 end
 
 -- wiersz: "0\tIdlewood\t{028151}gang CWL\t{C43030}za 20 minut"
@@ -2276,6 +2285,8 @@ local function autoStep()
 end
 
 local function runAuto()
+    -- bezczynny i nie pora: wyjscie bez sprawdzania SA-MP i pcall (co klatke)
+    if auto.state == 'idle' and (auto.disabled or not (cfg.autoRefresh or auto.force) or os.clock() < auto.nextAt) then return end
     if not sampReady() or type(sampProcessChatInput) ~= 'function' then return end
     local ok, err = pcall(autoStep)
     if not ok then
@@ -2447,8 +2458,8 @@ local function sync(phase)
             local t = TAGS[idx]
             local ok, h = pcall(addBlipForCoord, t[1], t[2], t[3])
             if ok and h and doesBlipExist(h) then
+                active[idx], b = h, h                              -- najpierw zapamietaj (blad nizej = bez wycieku blipa)
                 changeBlipDisplay(h, BLIP_DISPLAY_BLIP_ONLY)
-                active[idx], b = h, h
             else
                 failed = failed + 1
             end
@@ -2543,7 +2554,7 @@ end
 -- HUD (budowany co 0.5 s, rysowany co klatke)
 ------------------------------------------------------------------------
 
-local hudLines, hudAt = {}, -1e9
+local hudLines, hudAt, hudW, hudLH = {}, -1e9, 0, 0
 local soonList = {}       -- najblizsze odblokowania cudzych: { idx, sid, g, rem, d }
 local stats = { ready = 0, locked = 0 }
 
@@ -2615,7 +2626,7 @@ local function buildHud()
         out[2] = '{AAAAAA}ustaw gang w menu'
     else
         if targetIdx then
-            local sid, g = tagInfo(targetIdx)
+            local _, g = tagInfo(targetIdx)
             out[#out + 1] = ('{33FF66}teraz {FFFFFF}%s {%s}%s {AAAAAA}%d m%s%s'):format(
                 g.z or '?', hex(g.c), gangTag(g.o), floor(dist2d(targetIdx, px, py) + 0.5),
                 stats.ready > 1 and ('  +' .. (stats.ready - 1)) or '', tpTag(targetIdx))
@@ -2645,13 +2656,14 @@ end
 
 local function drawHud(now)
     if not cfg.hud or not inWorld() then return end
-    if now - hudAt >= 0.5 then
+    if now - hudAt >= 0.5 then                                     -- tekst i wymiary co 0.5 s, nie co klatke
         hudAt = now
         buildHud()
+        local w = 0
+        for _, l in ipairs(hudLines) do w = max(w, textWidth(l)) end
+        hudW, hudLH = w, lineHeight()
     end
-    local lh = lineHeight()
-    local w = 0
-    for _, l in ipairs(hudLines) do w = max(w, textWidth(l)) end
+    local lh, w = hudLH, hudW
     local h = lh * #hudLines
     local x, y = A.hudPlace('graffiti', w + 2 * HUD_PAD, h + 2 * HUD_PAD, 0.015, 0.64)
     renderDrawBox(x, y, w + 2 * HUD_PAD, h + 2 * HUD_PAD, 0x60000000)
@@ -2741,9 +2753,10 @@ local function myCar()
     return ok and car or nil
 end
 
-local function vehOk(car)
+local function vehAlive(car) return doesVehicleExist(car) and not isCarDead(car) end
+local function vehOk(car)                                          -- co klatke: pcall bez nowej closure
     if not car then return false end
-    local ok, r = pcall(function() return doesVehicleExist(car) and not isCarDead(car) end)
+    local ok, r = pcall(vehAlive, car)
     return ok and r == true
 end
 
@@ -2808,7 +2821,6 @@ local function rdOk(addr, n)
 end
 local function ru32(a) return tonumber(A.ffi.cast('uint32_t*', a)[0]) end
 local function ru16(a) return tonumber(A.ffi.cast('uint16_t*', a)[0]) end
-local function ri16(a) return tonumber(A.ffi.cast('int16_t*', a)[0]) end
 local function rnNodes(a) local p = PATHS + 0x804 + a * 4; return rdOk(p) and ru32(p) or 0 end
 local function rnLinks(a) local p = PATHS + 0xA44 + a * 4; return rdOk(p) and ru32(p) or 0 end
 local function rnCount(off, a) local p = PATHS + off + a * 4; return rdOk(p) and ru32(p) or nil end
@@ -2890,20 +2902,31 @@ end
 -- budowa obszaru po kawalku (400 wezlow na klatke - bez przyciec)
 local function rnBuildChunk(B)
     local a, b, L = B.a, B.b, B.L
-    local last = min(B.V, B.i + 400) - 1
-    for i = B.i, last do
-        local n = b + i * 0x1C
-        local x, y, z = ri16(n + 8) / 8, ri16(n + 10) / 8, ri16(n + 12) / 8
-        local water = (ru32(n + 0x18) % 256) >= 128 and z < 3
+    local first, last = B.i, min(B.V, B.i + 400) - 1
+    -- miedzy klatkami gra mogla zwolnic/przeniesc obszar: kazdy kawalek sprawdzany od nowa, inaczej budowa
+    -- przerwana (czesciowe wezly usuniete, rnUpdate zacznie obszar od nowa)
+    if last >= first and (rnNodes(a) ~= b or not rdOk(b + first * 0x1C, (last - first + 1) * 0x1C)) then
+        for _, id in ipairs(B.ids) do RN.px[id], RN.py[id], RN.pz[id], RN.adj[id] = nil, nil, nil, nil end
+        RN.build = nil
+        return
+    end
+    -- jeden cast na kawalek (nie na kazdy odczyt): wezel 0x1C = 14 x int16 = 7 x uint32, polaczenie = 2 x uint16
+    local cast = A.ffi.cast
+    local i16, u16, u32 = cast('int16_t*', b), cast('uint16_t*', b), cast('uint32_t*', b)
+    local l16 = L >= 0x10000 and cast('uint16_t*', L) or nil
+    for i = first, last do
+        local h = i * 14
+        local x, y, z = i16[h + 4] / 8, i16[h + 5] / 8, i16[h + 6] / 8     -- +8, +10, +12
+        local fl = tonumber(u32[i * 7 + 6])                                 -- +0x18
+        local water = (fl % 256) >= 128 and z < 3
         if not water then
             local id = a * 65536 + i
             local l = {}
-            local base, cnt = ru16(n + 0x10), ru32(n + 0x18) % 16
-            if cnt > 0 and L >= 0x10000 and rdOk(L + base * 4, cnt * 4) then
-                for k = 0, cnt - 1 do
-                    local p = L + (base + k) * 4
-                    local ta = ru16(p)
-                    if ta < 64 then l[#l + 1] = ta * 65536 + ru16(p + 2) end
+            local base, cnt = u16[h + 8], fl % 16                           -- +0x10
+            if cnt > 0 and l16 and rdOk(L + base * 4, cnt * 4) then
+                for k = base * 2, (base + cnt - 1) * 2, 2 do
+                    local ta = l16[k]
+                    if ta < 64 then l[#l + 1] = ta * 65536 + l16[k + 1] end
                 end
             end
             RN.px[id], RN.py[id], RN.pz[id], RN.adj[id] = x, y, z, l
@@ -3040,13 +3063,14 @@ local function rnPlan(sx, sy, sz, tx, ty, tz)
 end
 
 local function rnPath(job, last)
-    local ids, c = {}, last
+    local ids, c = {}, last                                        -- od konca (bez table.insert na poczatek: O(n^2))
     while c do
-        table.insert(ids, 1, c)
+        ids[#ids + 1] = c
         c = job.from[c]
     end
     local pts = {}
-    for _, id in ipairs(ids) do
+    for k = #ids, 1, -1 do
+        local id = ids[k]
         local x, y, z = RN.px[id], RN.py[id], RN.pz[id]
         if x then
             local p = pts[#pts]
@@ -3201,36 +3225,45 @@ local function pathLook(path, wi, x, y, L)
     end
 end
 
+-- droga do konca trasy: dlugosci od kazdego punktu do konca liczone raz na trase (path.cum), nie co klatke
+-- (trasa po drogach po wygladzeniu ma tysiace punktow; lamana nie jest zmieniana po zbudowaniu)
 local function pathLeft(path, wi, x, y)
     local p = path[wi + 1]
     if not p then return sqrt(dist2(path[wi].x, path[wi].y, x, y)) end
-    local d, lx, ly = sqrt(dist2(p.x, p.y, x, y)), p.x, p.y
-    for i = wi + 2, #path do
-        d = d + sqrt(dist2(path[i].x, path[i].y, lx, ly))
-        lx, ly = path[i].x, path[i].y
+    local cum = path.cum
+    if not cum then
+        local n, s = #path, 0
+        cum = { [n] = 0 }
+        for i = n - 1, 1, -1 do
+            s = s + sqrt(dist2(path[i + 1].x, path[i + 1].y, path[i].x, path[i].y))
+            cum[i] = s
+        end
+        path.cum = cum
     end
-    return d
+    return sqrt(dist2(p.x, p.y, x, y)) + cum[wi + 1]
 end
 
 -- predkosc, z jaka mozna jechac teraz, zeby lagodnie wyhamowac przed kazdym zakretem i przed celem.
 -- Zakret = zmiana kierunku trasy na odcinku ~14 m (trasa jest wygladzona, wiec pojedyncze katy sa male).
 local DEC = 4.5                                                    -- [m/s^2] spokojne hamowanie
+local SP_S, SP_H = {}, {}                                          -- bufory speedPlan (co klatke, bez nowych tabel)
 local function speedPlan(path, wi, x, y, vmax, stopR)
-    local S, H = {}, {}
+    local S, H, ns = SP_S, SP_H, 0
     local s, lx, ly = 0, x, y
     for i = wi + 1, #path do
         local p = path[i]
         local seg = sqrt(dist2(p.x, p.y, lx, ly))
         if seg > 0.3 then
-            S[#S + 1], H[#H + 1] = s, hdg(lx, ly, p.x, p.y)
+            ns = ns + 1
+            S[ns], H[ns] = s, hdg(lx, ly, p.x, p.y)
         end
         s = s + seg
         lx, ly = p.x, p.y
         if s > 130 then break end
     end
     local lim, k = vmax, 1
-    for j = 1, #S do
-        while k < #S and S[k] - S[j] < 14 do k = k + 1 end
+    for j = 1, ns do
+        while k < ns and S[k] - S[j] < 14 do k = k + 1 end
         if k <= j then break end
         local ang = math.abs(wrap180(H[k] - H[j]))
         if ang > 12 then
@@ -3273,21 +3306,6 @@ local function footStart(now, px, py, pz)
     local d = MV.dest
     local F = { stucks = 0, lookAt = 0, path = nil, wi = 1, ang = MV.ft and MV.ft.ang }
     MV.ft = F
-    if d.path and #d.path >= 2 then                                -- nauczony slad: od najblizszego punktu do celu
-        local k, kd
-        for i, p in ipairs(d.path) do
-            local dd = dist2(p[1], p[2], px, py)
-            if not kd or dd < kd then k, kd = i, dd end
-        end
-        if kd and kd < 25 * 25 then
-            local path = { { x = px, y = py, z = pz } }
-            for i = k, #d.path do path[#path + 1] = { x = d.path[i][1], y = d.path[i][2], z = d.path[i][3] } end
-            path[#path + 1] = { x = d.x, y = d.y, z = d.z, final = true }
-            F.path, F.wi, F.local_, F.fixed = path, 1, true, true
-            space(false)
-            return
-        end
-    end
     if dist2(d.x, d.y, px, py) > 45 * 45 then
         F.waitRN = true                                            -- trasa po drogach (footStep)
     else
@@ -3339,7 +3357,6 @@ local function footStep(now, px, py, pz)
             return 'run'
         end
         F.side, F.ang = nil, nil
-        if F.fixed then return 'run' end                           -- nauczony slad: wracamy na niego
         F.local_, F.path = dt2 < 30 * 30, nil
         if F.local_ then F.nav = NF.start(px, py, pz, d.x, d.y, navTz(d, pz), d.goalR or 0.8, false, now) else F.waitRN = true end
         return 'run'
@@ -3772,6 +3789,11 @@ local function zmod()
     return nil
 end
 
+-- rodzaje komunikatow dla zEvent (stale: zjStep pyta co klatke, bez nowych tabel)
+local ZK = { prompt = { prompt = true }, start = { start = true }, hours = { hours = true },
+    result = { locked = true, taken = true, war = true, own = true, win = true }, win = { win = true },
+    fail = { fail = true, lost = true } }
+
 -- komunikat o strefach po 'since' (z modulu Strefy): kinds = { start = true, ... }; id = nil -> dowolna strefa
 local function zEvent(since, kinds, id)
     local sz = zmod()
@@ -3877,7 +3899,7 @@ local function zjStep(now, px, py, pz)
         local zs = sz.zone(z.id)
         if st == 'zgo' and zs and zs.mine then GB.state = 'pick'; return end
         -- checkpoint strefy juz pod nami (serwer napisal "Wcisnij Y"): dalej nie jedziemy
-        if d2 < 4 * 4 and zEvent(now - 1.5, { prompt = true }) then
+        if d2 < 4 * 4 and zEvent(now - 1.5, ZK.prompt) then
             mvHold()
             if st == 'zback' then GB.state = 'zhold' else GB.state, ZB.pressN, ZB.pressAt, ZB.arriveAt = 'zpress', 0, nil, now end
             return
@@ -3901,16 +3923,16 @@ local function zjStep(now, px, py, pz)
             return zoneBack(now, px, py, pz, z, 'zgo')
         end
         local since = (ZB.pressAt or ZB.arriveAt) - 0.3
-        local e = zEvent(since, { start = true }, z.id)
+        local e = zEvent(since, ZK.start, z.id)
         if e then
             ZB.t0, GB.state = e.t, 'zhold'
             gbLog(('strefa %s (%d): przejecie ruszylo'):format(z.name, z.id))
             return
         end
         if ZB.pressAt then
-            e = zEvent(since, { hours = true }, nil)
+            e = zEvent(since, ZK.hours, nil)
             if e then return gbStop('Strefy Bot: przejmowanie stref jest dozwolone tylko od 8 rano do polnocy.') end
-            e = zEvent(since, { locked = true, taken = true, war = true, own = true, win = true }, z.id)
+            e = zEvent(since, ZK.result, z.id)
             if e then
                 if e.kind == 'locked' then
                     sz.lock(z.id, 600)
@@ -3932,7 +3954,7 @@ local function zjStep(now, px, py, pz)
         if ZB.pressAt and now - ZB.pressAt < 3 then GB.why = ('strefa %s: Y'):format(z.name); return end
         if not ZB.pressAt and now - ZB.arriveAt < 0.6 then GB.why = 'staje'; return end
         -- serwer nie napisal "Wcisnij Y" (checkpoint jeszcze nie pod nami): podjedz dokladniej, max 2 razy
-        if not ZB.pressAt and d2 > 1.0 and (ZB.nudge or 0) < 2 and not zEvent(ZB.arriveAt - 4, { prompt = true }) then
+        if not ZB.pressAt and d2 > 1.0 and (ZB.nudge or 0) < 2 and not zEvent(ZB.arriveAt - 4, ZK.prompt) then
             ZB.nudge = (ZB.nudge or 0) + 1
             local dd = zoneDest(z)
             dd.park, dd.reach = 0.7, 0.6
@@ -3962,7 +3984,7 @@ local function zjStep(now, px, py, pz)
 
     if st == 'zhold' then
         local el = now - ZB.t0
-        local e = zEvent(ZB.t0 - 0.5, { win = true }, z.id)
+        local e = zEvent(ZB.t0 - 0.5, ZK.win, z.id)
         local zs = sz.zone(z.id)
         if e or (zs and zs.mine and el > 5) then
             ZB.done = ZB.done + 1
@@ -3972,7 +3994,7 @@ local function zjStep(now, px, py, pz)
             GB.state = 'pick'
             return
         end
-        e = zEvent(ZB.t0 + 0.5, { fail = true, lost = true }, z.id)
+        e = zEvent(ZB.t0 + 0.5, ZK.fail, z.id)
         if e then
             ZB.skip[z.id] = now + 120
             gbLog(('strefa %s (%d): przejecie nieudane - wroce za 2 min'):format(z.name, z.id))
@@ -4048,11 +4070,17 @@ local function gbStep(now)
 end
 
 local gbFont
+local HC = {}                                                      -- tekst HUD-u i jego szerokosc (przeliczane przy zmianie)
 local function gbHud()
     if not cfg.botHud or not A.drawOk or not (GB.on or A.menuOpen) then return end
     gbFont = gbFont or renderCreateFont('Arial', 9, 5)
-    local txt = GB.on and (('Strefy bot  %d  '):format(ZB.done) .. (GB.why ~= '' and GB.why or GB.state)) or 'Strefy bot'
-    local w = renderGetFontDrawTextLength(gbFont, txt)
+    local why = GB.why ~= '' and GB.why or GB.state
+    if not HC.txt or HC.on ~= GB.on or HC.why ~= why or HC.done ~= ZB.done then
+        local t = GB.on and (('Strefy bot  %d  '):format(ZB.done) .. why) or 'Strefy bot'
+        local tw = renderGetFontDrawTextLength(gbFont, t)
+        HC.on, HC.why, HC.done, HC.txt, HC.w = GB.on, why, ZB.done, t, tw
+    end
+    local txt, w = HC.txt, HC.w
     local x, y = A.hudPlace('grafbot', w + 14, 18, 0.47, 0.14)
     renderDrawBox(x, y, w + 14, 18, 0x90000000)
     renderDrawBox(x, y, 3, 18, not GB.on and 0xFF666666 or (GB.why == 'pauza' and 0xFFFFD24A or 0xFF33FF66))
@@ -4074,7 +4102,7 @@ local function zMenu()
             if sz.zoneReady(id) then ready = ready + 1 end
         end
     end
-    ui.kv('Status', on and (GB.why ~= '' and GB.why or GB.state) or 'wylaczony', on and 0xFF33FF66 or 0xFF8A8A96)
+    ui.kv('Status', on and A.u8(GB.why ~= '' and GB.why or GB.state) or 'wylaczony', on and 0xFF33FF66 or 0xFF8A8A96)
     ui.kv('Nasze / gotowe', ('%d / %d  (z %d)'):format(mine, ready, total))
     ui.kv('Przejete teraz', ZB.done)
     if ui.button((on and 'Stop' or 'Start') .. '##zbtoggle', nil,
@@ -4119,6 +4147,10 @@ return {
     zmenu = zMenu,
     hud = gbHud,
     step = function(now)
+        if not GB.on and not ZB.toggle then                        -- bot wylaczony: bez pomiaru czasu i pcall co klatke
+            A.zoneBotOn, A.zoneBotBusy = false, false
+            return
+        end
         local t0 = A.hires()
         local ok, err = pcall(gbStep, now)
         if not ok and err ~= GB.lastErr then GB.lastErr = err; gbLog('blad: ' .. tostring(err)) end
@@ -4129,8 +4161,8 @@ return {
         end
     end,
     key = function(vk)
-        if A.chatInputActive() or A.dialogActive() then return end
-        if vk == cfg.zoneKey then ZB.toggle = true end
+        if vk ~= cfg.zoneKey or A.chatInputActive() or A.dialogActive() then return end
+        ZB.toggle = true
     end,
     stop = function() if GB.on then gbStop() end end,
     release = releaseAll,
@@ -4146,7 +4178,7 @@ function M.init()
     load()
     font = renderCreateFont('Arial', cfg.hudFontSize, 0x1 + 0x4)
     autoSchedule(15)
-    lastSave = os.clock()
+    lastSave = A.now()                 -- ten sam zegar co 'now' w M.frame (os.clock liczy od startu gry)
     GBX.init()
 end
 
@@ -4154,15 +4186,17 @@ function M.onKey(vk) GBX.key(vk) end
 
 function M.frame(now)
     if not A.menuOpen then gangSetup = nil end
+    GBX.step(now)                      -- bot pierwszy: blad w graffiti/HUD nie zatrzymuje sterowania
     runAuto()
     if now >= nextDialog then
         nextDialog = now + 0.1
         pollDialog()
     end
-    if now >= nextLabels then
+    if labelNext >= MAX_LABELS and now >= nextLabels then
         nextLabels = now + cfg.labelScanMs / 1000
-        scanLabels()
+        labelNext = 0
     end
+    if labelNext < MAX_LABELS then scanLabels() end
     local interval = cfg.blinkReady and 0.4 or cfg.refreshMs / 1000
     if dirty or now - lastSync >= interval then
         dirty = false
@@ -4180,7 +4214,6 @@ function M.frame(now)
     if A.drawOk then
         drawHud(now)
     end
-    GBX.step(now)
     pcall(GBX.hud)
 end
 
@@ -4207,31 +4240,43 @@ end
 local listMode = 1   -- 1 do przejecia, 2 wszystkie
 local gangBuf
 local soonAt = -1e9
+local rows, rowsMode = {}, 0   -- wiersze tabeli: liczone co 0.5 s (rowsMode = 0 wymusza), nie co klatke menu
 
-local function graffitiTable(px, py, h)
-    local im, ui = A.imgui, A.ui
-    local now = os.time()
-    local rows = {}
+local function byRowDist(a, b) return (a.d or 1e9) < (b.d or 1e9) end
+
+local function buildRows(px, py)
+    local out = {}
     if listMode == 1 then
         for sid, g in pairs(gangs) do
             if isEnemy(g) and isPaintable(g) then
                 local idx = tagOf[sid]
-                rows[#rows + 1] = { idx = idx, sid = sid, g = g, rem = 0, d = (idx and px) and dist2d(idx, px, py) or nil }
+                out[#out + 1] = { idx = idx, sid = sid, g = g, d = (idx and px) and dist2d(idx, px, py) or nil }
             end
         end
-        table.sort(rows, function(a, b) return (a.d or 1e9) < (b.d or 1e9) end)
-        for _, e in ipairs(soonList) do rows[#rows + 1] = e end
+        table.sort(out, byRowDist)
+        for _, e in ipairs(soonList) do out[#out + 1] = e end    -- rebuildSoon tworzy zawsze nowe wpisy
     else
         for sid = 0, SERVER_TAGS - 1 do
             local g = gangs[sid]
             if g and g.o then
                 local idx = tagOf[sid]
-                rows[#rows + 1] = { idx = idx, sid = sid, g = g, rem = (g.cd or 0) - now,
-                    d = (idx and px) and dist2d(idx, px, py) or nil }
+                out[#out + 1] = { idx = idx, sid = sid, g = g, d = (idx and px) and dist2d(idx, px, py) or nil }
             end
         end
-        table.sort(rows, function(a, b) return (a.d or 1e9) < (b.d or 1e9) end)
+        table.sort(out, byRowDist)
     end
+    for _, e in ipairs(out) do                                     -- staly tekst wiersza
+        local g = e.g
+        e.zt, e.col, e.tag, e.mine = g.z or ('#' .. e.sid), 0xFF000000 + brighten(g.c or 0xAAAAAA), gangTag(g.o), isMine(g.o)
+        e.dt, e.gps = e.d and (floor(e.d + 0.5) .. ' m') or '', 'GPS##grfwp' .. e.sid
+    end
+    rows, rowsMode = out, listMode
+end
+
+local function graffitiTable(px, py, h)
+    local im, ui = A.imgui, A.ui
+    local now = os.time()
+    if rowsMode ~= listMode then buildRows(px, py) end
 
     local W = ui.W
     im.BeginChild('##grftable', im.ImVec2(W, h), true)
@@ -4239,18 +4284,17 @@ local function graffitiTable(px, py, h)
     im.Columns(4, '##grfcols', false)
     im.SetColumnWidth(0, W * 0.44); im.SetColumnWidth(1, W * 0.16); im.SetColumnWidth(2, W * 0.18)
     for _, e in ipairs(rows) do
-        local g = e.g
-        ui.text(g.z or ('#' .. e.sid)); im.NextColumn()
-        ui.textCol(0xFF000000 + brighten(g.c or 0xAAAAAA), gangTag(g.o)); im.NextColumn()
-        local tm = timerText(g, now)
-        if isMine(g.o) then ui.textDim('nasze')
+        ui.text(e.zt); im.NextColumn()
+        ui.textCol(e.col, e.tag); im.NextColumn()
+        local tm = timerText(e.g, now)
+        if e.mine then ui.textDim('nasze')
         elseif tm then ui.textCol(0xFFFFD24A, tm)
         else ui.textCol(0xFF33FF66, 'teraz') end
         im.NextColumn()
-        ui.textDim(e.d and (floor(e.d + 0.5) .. ' m') or '')
+        ui.textDim(e.dt)
         if e.idx then
             im.SameLine()
-            if im.SmallButton('GPS##grfwp' .. e.sid) then setWaypoint(e.idx) end
+            if im.SmallButton(e.gps) then setWaypoint(e.idx) end
         end
         im.NextColumn()
     end
@@ -4266,6 +4310,7 @@ function M.menu()
     if t - soonAt > 0.5 then
         soonAt = t
         pcall(rebuildSoon, px, py)
+        rowsMode = 0
     end
 
     ui.group('Graffiti', function()
