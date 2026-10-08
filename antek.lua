@@ -11532,11 +11532,11 @@ end)(A))
 
 -- ============================================================================
 -- MODUL: MAKRO (dawny AutoY.ahk) - szybkie wciskanie klawisza (domyslnie Y)
--- Sterowanie tylko klawiszami (domyslnie Lewo / Prawo). Menu: zakladka Strefy.
--- Tempo dobierane samo: wcisniecie i puszczenie trwaja kazde co najmniej jedna
--- klatke i 18 ms - gra czyta klawiature raz na klatke, wiec kazde wcisniecie
--- jest zauwazone, a przy 60-100 FPS to ok. 25-30 wcisniec na sekunde (jak w AHK).
--- Pauza: czat, dialog, menu, menu pauzy, gra bez fokusu.
+-- Sterowanie tylko klawiszami (domyslnie Lewo / Prawo; ten sam klawisz = przelacznik). Menu: zakladka Boty.
+-- Tempo: C.rate wcisniec na sekunde; wcisniecie i puszczenie trwaja po pol okresu (30/s = 16.7 ms),
+-- ale kazde co najmniej jedna klatke - gra czyta klawiature raz na klatke, wiec kazde wcisniecie
+-- jest zauwazone; gorna granica to polowa FPS.
+-- Pauza: czat, dialog, menu, menu pauzy, gra bez fokusu, Gornik / Strefy Bot w akcji.
 -- ============================================================================
 A.register((function(A)
 local ffi = A.ffi
@@ -11554,23 +11554,38 @@ local C = {
 
 -- Stale tempo: kolejne zmiany stanu klawisza sa planowane od poprzedniego terminu (nie od "teraz"),
 -- wiec nie ma dryfu; po przycieciu gry nie ma serii nadrabiajacej; kazdy stan trwa min. 1 pelna klatke
--- (gra czyta klawiature raz na klatke, krotsze stuknicie by zgubila).
+-- (gra czyta klawiature raz na klatke, krotsze stuknicie by zgubila). Zegar: A.hires (QPC).
 local on, down, paused = false, false, false
 local nextFlip, flipFrame, frameNo = 0, -1, 0
-local focused, focusAt = true, 0
-local scan = 0x15
-local font, pid
+local scan, ext, synVk = 0x15, 0, 0x59           -- scancode, flaga EXTENDEDKEY, VK w WM_KEYDOWN
+local SYN = { vk = 0x59, untilT = 0 }            -- A.synth: wlasne wcisniecia nie sa skrotami innych modulow
+local kbd, fgWin, winPid, myPid, pidBuf          -- WinAPI rozwiazane raz (bez closure / ffi.new co klatke)
+local font, hudW
+
+-- lewy/prawy Shift, Ctrl, Alt przychodza w WM_KEYDOWN jako zwykly Shift, Ctrl, Alt
+local VK_GENERIC = { [0xA0] = 0x10, [0xA1] = 0x10, [0xA2] = 0x11, [0xA3] = 0x11, [0xA4] = 0x12, [0xA5] = 0x12 }
 
 local function save() A.saveJson(FILE, C) end
 
+-- klawisze rozszerzone (strzalki, Insert, Delete, Home, End, PgUp/PgDn, prawy Ctrl/Alt) wymagaja flagi
+-- EXTENDEDKEY - bez niej gra dostaje klawisz z bloku numerycznego o tym samym scancode
 local function updScan()
-    local ok, s = pcall(function() return ffi.C.MapVirtualKeyA(C.key, 0) end)   -- MAPVK_VK_TO_VSC
-    s = ok and tonumber(s) or 0
+    local s, e = 0, 0
+    pcall(function()
+        local x = tonumber(ffi.C.MapVirtualKeyA(C.key, 4)) or 0                    -- MAPVK_VK_TO_VSC_EX
+        if A.bit.band(x, 0xFF00) == 0xE000 then
+            s, e = A.bit.band(x, 0xFF), 1
+        else
+            s = tonumber(ffi.C.MapVirtualKeyA(C.key, 0)) or 0                      -- MAPVK_VK_TO_VSC
+        end
+    end)
+    ext = e
     scan = s ~= 0 and s or 0x15
+    synVk = VK_GENERIC[C.key] or C.key
 end
 
 local function key(up)
-    pcall(function() ffi.C.keybd_event(0, scan, up and 0x000A or 0x0008, 0) end)   -- SCANCODE (+KEYUP)
+    if kbd then pcall(kbd, 0, scan, (up and 0x000A or 0x0008) + ext, 0) end    -- SCANCODE (+KEYUP) (+EXTENDEDKEY)
 end
 
 local function release()
@@ -11582,21 +11597,17 @@ end
 
 -- okno na pierwszym planie nalezy do procesu gry
 local function gameFocused()
-    local ok, r = pcall(function()
-        if not pid then pid = ffi.C.GetCurrentProcessId() end
-        local h = ffi.C.GetForegroundWindow()
-        if h == nil then return false end
-        local p = ffi.new('uint32_t[1]')
-        ffi.C.GetWindowThreadProcessId(h, p)
-        return p[0] == pid
-    end)
-    return not ok or r
+    if not pidBuf then return A.gameFocused() end
+    local h = fgWin()
+    if h == nil then return false end
+    winPid(h, pidBuf)
+    return pidBuf[0] == myPid
 end
 
 local function set(v)
     on = v and true or false
     if not on then release() end
-    nextFlip, focusAt = 0, 0
+    nextFlip = 0
 end
 
 function M.init()
@@ -11609,6 +11620,15 @@ function M.init()
         if type(t.rate) == 'number' then C.rate = A.clamp(math.floor(t.rate), 5, 60) end
     end
     save()
+    local okK, fk = pcall(function() return ffi.C.keybd_event end)
+    kbd = okK and fk or nil
+    local okF, fw, fp, me, buf = pcall(function()
+        local fwin, fpid, b = ffi.C.GetForegroundWindow, ffi.C.GetWindowThreadProcessId, ffi.new('uint32_t[1]')
+        local h = fwin()
+        if h ~= nil then fpid(h, b) end                  -- proba: typy argumentow pasuja (inaczej A.gameFocused)
+        return fwin, fpid, ffi.C.GetCurrentProcessId(), b
+    end)
+    if okF then fgWin, winPid, myPid, pidBuf = fw, fp, me, buf end
     updScan()
     font = renderCreateFont('Arial', 9, 5)
 end
@@ -11616,34 +11636,40 @@ end
 function M.onKey(vk)
     if vk ~= C.keyOn and vk ~= C.keyOff then return end
     if A.chatInputActive() or A.dialogActive() then return end
-    set(vk == C.keyOn)
+    if C.keyOn == C.keyOff then set(not on) else set(vk == C.keyOn) end
 end
 
 function M.frame(now)
     frameNo = frameNo + 1
     if on then
-        if now >= focusAt then focusAt, focused = now + 0.25, gameFocused() end
-        paused = A.menuOpen or A.miningBusy or A.minerAuto or A.zoneBotOn or A.pauseActive() or A.chatInputActive()
-            or A.dialogActive() or not focused
+        -- fokus co klatke (dwa tanie wywolania WinAPI): po alt-tabie (BackgroundPlay) zadne wcisniecie nie trafi do innego okna
+        paused = A.menuOpen or A.miningBusy or A.minerAuto or A.zoneBotOn or not gameFocused() or A.pauseActive()
+            or A.chatInputActive() or A.dialogActive()
         if paused then
             release()
             nextFlip = 0
         else
+            local t = A.hires()
             local phase = 0.5 / C.rate
-            if nextFlip == 0 then nextFlip = now end
-            if now >= nextFlip and frameNo > flipFrame then
+            if nextFlip == 0 or nextFlip - t > 1 then nextFlip = t end
+            if t >= nextFlip and frameNo > flipFrame then
                 down = not down
+                -- oznaczone dla rdzenia (nie skrot), chyba ze to tez Wlacz/Wylacz - wtedy jak dawniej
+                if down and C.key ~= C.keyOn and C.key ~= C.keyOff then
+                    SYN.vk, SYN.untilT = synVk, now + 0.08
+                    A.synth = SYN
+                end
                 key(not down)
                 flipFrame = frameNo
                 nextFlip = nextFlip + phase
-                if now - nextFlip > phase then nextFlip = now + phase end   -- po przycieciu: bez serii nadrabiania
+                if t - nextFlip > phase then nextFlip = t + phase end   -- po przycieciu: bez serii nadrabiania
             end
         end
     end
     if C.hud and A.drawOk and font and (on or A.menuOpen) then
-        local w = renderGetFontDrawTextLength(font, 'Makro')
-        local x, y = A.hudPlace('autoy', w + 14, 18, 0.47, 0.02)
-        renderDrawBox(x, y, w + 14, 18, 0x90000000)
+        hudW = hudW or renderGetFontDrawTextLength(font, 'Makro') + 14
+        local x, y = A.hudPlace('autoy', hudW, 18, 0.47, 0.02)
+        renderDrawBox(x, y, hudW, 18, 0x90000000)
         renderDrawBox(x, y, 3, 18, not on and 0xFF666666 or (paused and 0xFFFFD24A or 0xFF33FF66))
         renderFontDrawText(font, 'Makro', x + 8, y + 2, 0xFFFFFFFF)
     end
@@ -11652,7 +11678,7 @@ end
 function M.disable() set(false) end
 function M.terminate() release() end
 
--- grupa w zakladce Strefy
+-- grupa w zakladce Boty
 function M.menuGroup()
     local ui = A.ui
     ui.keyButton('Wlacz', function() return C.keyOn end, function(vk) C.keyOn = vk; save() end,
