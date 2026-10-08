@@ -201,13 +201,13 @@ A.json = json
 do
 local floor, max, min = math.floor, math.max, math.min
 
-function A.now()
-    if type(localClock) == 'function' then
-        local ok, t = pcall(localClock)
-        if ok and type(t) == 'number' then return t end
-    end
-    return os.clock()
+-- wolane setki razy na klatke: bez pcall i bez sprawdzania typu przy kazdym wywolaniu
+local clockFn = os.clock
+if type(localClock) == 'function' then
+    local ok, t = pcall(localClock)
+    if ok and type(t) == 'number' then clockFn = localClock end
 end
+function A.now() return clockFn() end
 
 function A.trim(s)
     s = tostring(s or '')
@@ -225,9 +225,9 @@ end
 function A.writeFile(path, data)
     local f = io.open(path, 'wb')
     if not f then return false end
-    f:write(data)
+    local ok = f:write(data)
     f:close()
-    return true
+    return ok ~= nil
 end
 
 function A.fileExists(path)
@@ -283,11 +283,34 @@ function A.clamp(v, lo, hi)
     return max(lo, min(hi, v))
 end
 
+-- Zapis: plik.tmp -> rename (crash gry w trakcie zapisu nie zostawia ucietego JSON-a).
+-- A.saveJson tylko koduje i odklada; na dysk trafia w A.flushSaves (main co 0.5 s + przy wyladowaniu),
+-- wiec suwak przeciagany w menu nie pisze pliku co klatke, a identyczna tresc nie jest zapisywana wcale.
+local pendingSaves, lastSaved = {}, {}
+
+local function writeAtomic(path, s)
+    local tmp = path .. '.tmp'
+    if not A.writeFile(tmp, s) then
+        A.ensureDirs()
+        if not A.writeFile(tmp, s) then return false end
+    end
+    os.remove(path)
+    if os.rename(tmp, path) then return true end
+    os.remove(tmp)
+    return A.writeFile(path, s)
+end
+
 function A.loadJson(path)
     local d = A.readFile(path)
-    if not d or d == '' then return nil end
+    if not d or d == '' then
+        d = A.readFile(path .. '.tmp')                  -- crash miedzy remove a rename
+        if not d or d == '' then return nil end
+    end
     local ok, t = pcall(json.decode, d)
-    if ok and type(t) == 'table' then return t end
+    if ok and type(t) == 'table' then
+        lastSaved[path] = d
+        return t
+    end
     os.remove(path .. '.bak')
     os.rename(path, path .. '.bak')
     A.log('antek.cc', 'uszkodzony plik ' .. path .. ' (kopia w .bak): ' .. tostring(t))
@@ -300,9 +323,19 @@ function A.saveJson(path, t)
         A.log('antek.cc', 'json.encode: ' .. tostring(s))
         return false
     end
-    if A.writeFile(path, s) then return true end
-    A.ensureDirs()
-    return A.writeFile(path, s)
+    pendingSaves[path] = lastSaved[path] ~= s and s or nil
+    return true
+end
+
+function A.flushSaves()
+    for path, s in pairs(pendingSaves) do
+        pendingSaves[path] = nil
+        if writeAtomic(path, s) then
+            lastSaved[path] = s
+        else
+            A.log('antek.cc', 'nie moge zapisac ' .. path)
+        end
+    end
 end
 
 -- ---------------------------------------------------------------- kodowanie
@@ -315,7 +348,9 @@ local CP2U = {
     [0xAF] = 0x017B, [0xBF] = 0x017C,
 }
 A.CP1250 = CP2U
-local CP2U8, U82CP = {}, {}
+-- tabele dla gsub (brak w tabeli -> '?'), zamiast nowej closure przy kazdym wywolaniu
+local unknownQ = { __index = function() return '?' end }
+local CP2U8, U82CP = setmetatable({}, unknownQ), setmetatable({}, unknownQ)
 for b, cp in pairs(CP2U) do
     local u = string.char(0xC0 + floor(cp / 64), 0x80 + cp % 64)
     CP2U8[string.char(b)] = u
@@ -325,13 +360,13 @@ end
 function A.u8(s)
     s = tostring(s or '')
     if not s:find('[\128-\255]') then return s end
-    return (s:gsub('[\128-\255]', function(c) return CP2U8[c] or '?' end))
+    return (s:gsub('[\128-\255]', CP2U8))
 end
 
 function A.cp(s)
     s = tostring(s or '')
     if not s:find('[\128-\255]') then return s end
-    s = s:gsub('[\192-\223][\128-\191]', function(c) return U82CP[c] or '?' end)
+    s = s:gsub('[\192-\223][\128-\191]', U82CP)
     return (s:gsub('[\224-\255][\128-\191]*', '?'))
 end
 
@@ -404,21 +439,28 @@ A.cfg = {
     jitOff     = true,     -- jak w SAMPGPT: JIT wylaczony (stabilnosc z SF.lua)
     chatPollMs = 50,
     tab        = 'tracker',
-    modules    = { tracker = true, graffiti = true, statuetki = true, strefy = true, pool = true, gpt = true, autoy = true, karta = true },
+    modules    = { tracker = true, graffiti = true, statuetki = true, walizki = true, strefy = true, pool = true,
+                   gpt = true, autoy = true, karta = true, gornik = true },
     hud        = {},       -- id -> { fx, fy }
 }
 
 function A.loadCore()
     local t = A.loadJson(A.CORE_FILE)
     if not t then return false end
-    local hud = t.hud
-    t.hud = nil
+    local hud, mods = t.hud, t.modules
+    t.hud, t.modules = nil, nil
     A.overlay(A.cfg, t)
     if type(hud) == 'table' then
         for k, v in pairs(hud) do
             if type(v) == 'table' and tonumber(v[1]) and tonumber(v[2]) then
                 A.cfg.hud[k] = { tonumber(v[1]), tonumber(v[2]) }
             end
+        end
+    end
+    -- kazdy zapisany przelacznik (overlay pomijal moduly spoza listy domyslnej - np. wylaczony gornik wracal po restarcie)
+    if type(mods) == 'table' then
+        for k, v in pairs(mods) do
+            if type(k) == 'string' and type(v) == 'boolean' then A.cfg.modules[k] = v end
         end
     end
     return true
@@ -527,16 +569,21 @@ function A.chat(text, color)
     print(A.stripColors(text))
 end
 
--- okno gry na pierwszym planie (okno nalezy do procesu gry)
+-- okno gry na pierwszym planie (okno nalezy do procesu gry); wolane co klatke przez boty
+local pidBuf
+local function foreground()
+    if not pidBuf then
+        A.pid = ffi.C.GetCurrentProcessId()
+        pidBuf = ffi.new('uint32_t[1]')
+    end
+    local h = ffi.C.GetForegroundWindow()
+    if h == nil then return false end
+    ffi.C.GetWindowThreadProcessId(h, pidBuf)
+    return pidBuf[0] == A.pid
+end
+
 function A.gameFocused()
-    local ok, r = pcall(function()
-        if not A.pid then A.pid = ffi.C.GetCurrentProcessId() end
-        local h = ffi.C.GetForegroundWindow()
-        if h == nil then return false end
-        local p = ffi.new('uint32_t[1]')
-        ffi.C.GetWindowThreadProcessId(h, p)
-        return p[0] == A.pid
-    end)
+    local ok, r = pcall(foreground)
     return not ok or r
 end
 
@@ -917,12 +964,14 @@ local floor, nmax, nmin, nsqrt, nceil = math.floor, math.max, math.min, math.sqr
 local DIRS = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }
 
 local function los(x1, y1, z1, x2, y2, z2)
-    if (x2 - x1) ^ 2 + (y2 - y1) ^ 2 + (z2 - z1) ^ 2 < 1e-4 then return true end
+    local dx, dy, dz = x2 - x1, y2 - y1, z2 - z1
+    if dx * dx + dy * dy + dz * dz < 1e-4 then return true end
     return isLineOfSightClear(x1, y1, z1, x2, y2, z2, true, false, false, true, false)
 end
 
 local function ray(x1, y1, z1, x2, y2, z2)
-    if (x2 - x1) ^ 2 + (y2 - y1) ^ 2 + (z2 - z1) ^ 2 < 1e-4 then return nil end
+    local dx, dy, dz = x2 - x1, y2 - y1, z2 - z1
+    if dx * dx + dy * dy + dz * dz < 1e-4 then return nil end
     local hit, cp = processLineOfSight(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
     if hit and cp then return cp end
     return nil
@@ -980,8 +1029,12 @@ end
 A.navRay, A.navLos, A.entityPos = ray, los, entityPos
 
 -- precyzyjny zegar (QueryPerformanceCounter) do budzetow czasu na klatke; localClock bywa za malo dokladny
-local qpcBuf, qpcFreq = nil, nil
+local qpcBuf, qpcFreq, qpcFn = nil, nil, nil
 function A.hires()
+    if qpcFn then
+        qpcFn(qpcBuf)
+        return tonumber(qpcBuf[0]) / qpcFreq
+    end
     if qpcFreq == nil then
         qpcFreq = false
         pcall(function()
@@ -990,14 +1043,10 @@ function A.hires()
             pcall(ffi.cdef, 'int QueryPerformanceFrequency(int64_t *f);')
             local f, c = ffi.new('int64_t[1]'), ffi.new('int64_t[1]')
             if ffi.C.QueryPerformanceFrequency(f) ~= 0 and ffi.C.QueryPerformanceCounter(c) ~= 0 and tonumber(f[0]) > 0 then
-                qpcBuf, qpcFreq = c, tonumber(f[0])
+                qpcBuf, qpcFreq, qpcFn = c, tonumber(f[0]), ffi.C.QueryPerformanceCounter
             end
         end)
-    end
-    if qpcFreq then
-        local ok = pcall(A.ffi.C.QueryPerformanceCounter, qpcBuf)
-        if ok then return tonumber(qpcBuf[0]) / qpcFreq end
-        qpcFreq = false
+        if qpcFn then return A.hires() end
     end
     return os.clock()
 end
@@ -1007,7 +1056,7 @@ end
 --    UNKNOWN_FAR (dalej od startu brak ziemi = teren niewczytany, traktowany jak plaski), tag (log),
 --    SOFT_CLEAR / SOFT_COST (krawedz blizej sciany niz SOFT_CLEAR kosztuje SOFT_COST razy wiecej - trasa srodkiem)
 function A.newNav(p)
-    p.edges, p.nEdges, p.cacheAt, p.cacheInt, p.blocks, p.warned, p.seq, p.pens = {}, 0, -1e9, nil, {}, false, 0, {}
+    p.edges, p.nEdges, p.cacheAt, p.cacheInt, p.blocks, p.warned, p.seq = {}, 0, -1e9, nil, {}, false, 0
     local N = { p = p, ray = ray, los = los, entityPos = entityPos }
 
     -- ziemia pod (x, y) w zasiegu kroku od ref; nil = sciana, dziura albo za stromo; 2. wynik: teren niewczytany
@@ -1113,24 +1162,29 @@ function A.newNav(p)
             and los(x1 - ox, y1 - oy, z1 + h, x2 - ox, y2 - oy, z2 + h)
     end
 
-    -- ziemia w sasiedniej komorce (nil = nie przejdzie) i mnoznik kosztu
-    local function edge(n, ix, iy, x, y, now)
+    -- ziemia w sasiedniej komorce d (indeks DIRS; nil = nie przejdzie) i mnoznik kosztu.
+    -- Cache: p.edges[klucz wezla] = { [d] = ziemia|false, [d + 8] = kara } - bez sklejania stringow per krawedz.
+    local function edge(n, d, x, y, now)
         if N.blocked(n.x, n.y, x, y, now) then return nil end
-        local k = (not n.start) and (n.key .. '>' .. ix .. ':' .. iy) or nil  -- krawedzi ze startu nie cache'ujemy
-        if k then
-            local v = p.edges[k]
-            if v ~= nil then
-                if not v then return nil end
-                return v, p.pens[k] or 1
+        local row
+        if not n.start then                           -- krawedzi ze startu nie cache'ujemy
+            row = p.edges[n.key]
+            if row then
+                local v = row[d]
+                if v ~= nil then
+                    if not v then return nil end
+                    return v, row[d + 8] or 1
+                end
             end
         end
         local g, unknown = N.ground(x, y, n.gz)
         local v = (g and N.seg(n.x, n.y, n.gz, x, y, g, not n.start)) and g or false
         local pen = 1
         if v and p.SOFT_CLEAR and not unknown and not soft(n.x, n.y, n.gz, x, y, v) then pen = p.SOFT_COST end
-        if k and not unknown then
-            p.edges[k], p.nEdges = v, p.nEdges + 1
-            if pen ~= 1 then p.pens[k] = pen end
+        if not n.start and not unknown then
+            if not row then row = {}; p.edges[n.key] = row end
+            row[d], p.nEdges = v, p.nEdges + 1
+            if pen ~= 1 then row[d + 8] = pen end
         end
         if not v then return nil end
         return v, pen
@@ -1153,7 +1207,7 @@ function A.newNav(p)
         local okI, int = pcall(getActiveInterior)
         int = okI and int or 0
         if now - p.cacheAt > p.CACHE_TTL or p.cacheInt ~= int or p.nEdges > 50000 then
-            p.edges, p.nEdges, p.cacheAt, p.cacheInt, p.pens = {}, 0, now, int, {}
+            p.edges, p.nEdges, p.cacheAt, p.cacheInt = {}, 0, now, int
         end
         p.ox, p.oy, p.tgz = px, py, tz - 1.0
         local nav = { tx = tx, ty = ty, tz = tz, r2 = goalR * goalR, rock = rock, t0 = A.now(), exp = 0,
@@ -1217,31 +1271,41 @@ function A.newNav(p)
             if not n.closed and e.g <= n.g then
                 n.closed = true
                 if not n.start and N.goal(nav, n) then
-                    local path = {}
+                    local rev = {}
                     while n and not n.start do
-                        table.insert(path, 1, { x = n.x, y = n.y, z = n.gz + 1.0 })
+                        rev[#rev + 1] = n
                         n = n.parent
+                    end
+                    local path, k = {}, #rev
+                    for i = k, 1, -1 do
+                        local r = rev[i]
+                        path[k - i + 1] = { x = r.x, y = r.y, z = r.gz + 1.0 }
                     end
                     return path
                 end
                 nav.exp = nav.exp + 1
                 if nav.exp > p.MAX_EXP then return 'fail' end
-                for _, dd in ipairs(DIRS) do
+                local nodes, tx, ty, W = nav.nodes, nav.tx, nav.ty, p.WEIGHT
+                for d = 1, 8 do
+                    local dd = DIRS[d]
                     local ix, iy = n.ix + dd[1], n.iy + dd[2]
                     local x, y = (ix + 0.5) * CELL, (iy + 0.5) * CELL
                     if x >= nav.x1 and x <= nav.x2 and y >= nav.y1 and y <= nav.y2 then
-                        local gz, pen = edge(n, ix, iy, x, y, now)
+                        local gz, pen = edge(n, d, x, y, now)
                         if gz then
-                            local key = ix .. ':' .. iy .. ':' .. floor(gz * 2 + 0.5)
-                            local m = nav.nodes[key]
+                            -- klucz liczbowy (komorka + wysokosc co 0.5 m); |ix|,|iy| < 32768, z w -1024..7168 m
+                            local key = ((ix + 32768) * 65536 + iy + 32768) * 16384 + floor(gz * 2 + 0.5) + 2048
+                            local m = nodes[key]
                             if not m then
                                 m = { key = key, ix = ix, iy = iy, x = x, y = y, gz = gz, g = math.huge }
-                                nav.nodes[key] = m
+                                nodes[key] = m
                             end
-                            local g = n.g + nsqrt((x - n.x) ^ 2 + (y - n.y) ^ 2 + (gz - n.gz) ^ 2) * pen
+                            local ddx, ddy, ddz = x - n.x, y - n.y, gz - n.gz
+                            local g = n.g + nsqrt(ddx * ddx + ddy * ddy + ddz * ddz) * pen
                             if not m.closed and g < m.g then
                                 m.g, m.parent = g, n
-                                hpush(nav.open, { f = g + p.WEIGHT * nsqrt((nav.tx - x) ^ 2 + (nav.ty - y) ^ 2), key = key, g = g })
+                                local hx, hy = tx - x, ty - y
+                                hpush(nav.open, { f = g + W * nsqrt(hx * hx + hy * hy), key = key, g = g })
                             end
                         end
                     end
@@ -14269,10 +14333,13 @@ if im then
         dim     = { 0.420, 0.410, 0.480, 1 },
     }
 
+    local u32memo = {}                -- kolory palety sa stale: liczone raz, nie ~30 razy na klatke menu
     local function u32(c, a)
-        local r, g, b = math.floor(c[1] * 255), math.floor(c[2] * 255), math.floor(c[3] * 255)
-        local al = math.floor((a or c[4]) * 255)
-        return al * 16777216 + b * 65536 + g * 256 + r
+        if a == nil and u32memo[c] then return u32memo[c] end
+        local r, g, b = floor(c[1] * 255), floor(c[2] * 255), floor(c[3] * 255)
+        local v = floor((a or c[4]) * 255) * 16777216 + b * 65536 + g * 256 + r
+        if a == nil then u32memo[c] = v end
+        return v
     end
 
     local function V2(x, y) return im.ImVec2(x, y) end
@@ -14709,7 +14776,8 @@ local MODIFIER_VK = { [0x10] = true, [0x11] = true, [0x12] = true, [0x5B] = true
 addEventHandler('onWindowMessage', function(msg, wparam, lparam)
     -- klawisz wcisniety przez bota (gornik): nie jest skrotem dla zadnego modulu
     local sy = A.synth
-    if sy and A.now() < sy.untilT and ((msg == 0x020A and sy.vk == 'wheel') or ((msg == 0x0100 or msg == 0x0104) and wparam == sy.vk)) then
+    if sy and ((msg == 0x020A and sy.vk == 'wheel') or ((msg == 0x0100 or msg == 0x0104) and wparam == sy.vk))
+        and A.now() < sy.untilT then
         return
     end
     if msg == 0x020A then                                          -- WM_MOUSEWHEEL
@@ -14762,6 +14830,7 @@ addEventHandler('onScriptTerminate', function(scr, quit)
         if m.ready and m.terminate then pcall(m.terminate, quit) end
     end
     pcall(A.saveCore)
+    pcall(A.flushSaves)
 end)
 
 -- ============================================================================
@@ -14884,6 +14953,7 @@ function main()
         if now >= nextSup then
             nextSup = now + 0.5
             A.supervise()
+            A.flushSaves()
         end
         if now >= nextRes then
             nextRes = now + 1
