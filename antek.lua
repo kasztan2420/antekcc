@@ -1,12 +1,25 @@
+local VERSION = '2.0.0'
+
 script_name('antek.cc')
 script_author('antek')
-script_version('1.2.0')
-script_description('antek.cc: Tracker, Graffiti, Kasyno, Gornik, Bilard, SAMPGPT, Strefy, Statuetki w jednym menu. SF.lua + SAMP-API + mimgui')
+script_version(VERSION)
+script_description('antek.cc: Tracker, Gang (graffiti + strefy), Boty (kasyno, gornik, makro), Bilard, SAMPGPT '
+    .. 'w jednym menu. Wymaga: SF.lua, SAMP-API, mimgui.')
 script_properties('work-in-pause')
 
 -- Plik celowo w 100% ASCII: kodowanie pliku nie ma znaczenia dla MoonLoadera.
 -- Dane: moonloader\config\antek\*.json (+ pliki SAMPGPT: moonloader\config\sampgpt_*.txt).
 -- Przy pierwszym starcie importuje stare ustawienia: TagBlips.json, pooltracer.lua, PlayerTracker_*.txt.
+--
+-- Uklad pliku:
+--   CORE    pomocnicze, biblioteki, konfiguracja, SA-MP, FFI, watki, czat, HUD-y, moduly, nawigacja (A*)
+--   DANE    teleporty serwera, strefy gangowe
+--   MODULY  Tracker, Gang (graffiti + Strefy Bot), Strefy, Bilard, SAMPGPT, Makro, Kasyno, Gornik,
+--           Statuetki, Walizki
+--   MENU    mimgui + helpery UI, klawisze, zakladki Boty / Ustawienia, main()
+--
+-- Modul: A.register{ id, title, hidden?, init(), frame(now), menu(), disable(), terminate(quit), status(),
+--                     setupHint(), onKey(vk), onWheel(dir) } - wszystko poza id/title opcjonalne.
 
 pcall(require, 'moonloader')
 
@@ -14,7 +27,7 @@ local ffi = require 'ffi'
 local bit = require 'bit'
 
 local A = {
-    VERSION = '1.2',
+    VERSION = VERSION,
     ffi = ffi,
     bit = bit,
     mods = {},          -- id -> modul
@@ -328,11 +341,18 @@ function A.u8(s)
     return (s:gsub('[\128-\255]', function(c) return CP2U8[c] or '?' end))
 end
 
+-- jeden przebieg po sekwencjach UTF-8 (lead + kontynuacje); drugi przebieg psulby juz
+-- przekonwertowane bajty CP1250 (np. 0xE6 'c' z kreska wyglada jak lead 3-bajtowy)
 function A.cp(s)
     s = tostring(s or '')
     if not s:find('[\128-\255]') then return s end
-    s = s:gsub('[\192-\223][\128-\191]', function(c) return U82CP[c] or '?' end)
-    return (s:gsub('[\224-\255][\128-\191]*', '?'))
+    return (s:gsub('[\128-\255][\128-\191]*', function(c) return U82CP[c] or '?' end))
+end
+
+-- liczba -> int32 ze znakiem (kolory RGBA dla changeBlipColour)
+function A.toInt32(v)
+    v = v % 0x100000000
+    return v >= 0x80000000 and v - 0x100000000 or v
 end
 
 function A.stripColors(s)
@@ -404,7 +424,9 @@ A.cfg = {
     jitOff     = true,     -- jak w SAMPGPT: JIT wylaczony (stabilnosc z SF.lua)
     chatPollMs = 50,
     tab        = 'tracker',
-    modules    = { tracker = true, graffiti = true, statuetki = true, strefy = true, pool = true, gpt = true, autoy = true, karta = true },
+    -- komplet id modulow: A.overlay przenosi z pliku tylko klucze, ktore tu istnieja
+    modules    = { tracker = true, graffiti = true, strefy = true, pool = true, gpt = true, autoy = true, karta = true,
+                   gornik = true, statuetki = true, walizki = true },
     hud        = {},       -- id -> { fx, fy }
 }
 
@@ -414,6 +436,7 @@ function A.loadCore()
     local hud = t.hud
     t.hud = nil
     A.overlay(A.cfg, t)
+    A.cfg.chatPollMs = A.clamp(math.floor(A.cfg.chatPollMs), 20, 500)
     if type(hud) == 'table' then
         for k, v in pairs(hud) do
             if type(v) == 'table' and tonumber(v[1]) and tonumber(v[2]) then
@@ -430,7 +453,6 @@ end
 
 A.ensureDirs()
 A.loadCore()
--- v1.4: stan modulow z configu jest respektowany (wczesniej wymuszalismy ON przy kazdym starcie)
 A.saveCore()
 
 -- samp.events tylko gdy bilard wlaczony (kazde RPC przechodzi wtedy przez Lua)
@@ -1808,7 +1830,7 @@ local DEFAULTS = {
     maxBlips        = 15,
     radius          = 0,        -- [m, 2D] limit w trybie near, 0 = bez limitu
     filter          = 'all',    -- 'all' | 'enemy' | 'paint'
-    myGang          = 'CWL',    -- fragment nazwy naszego gangu
+    myGang          = '',       -- fragment nazwy naszego gangu (np. tag CWL); ustawiany w menu
     hideInInteriors = true,
     colourUnknown   = 3,        -- brak danych: ID koloru SA albo RGBA 0xRRGGBBAA
     minRadarLum     = 110,
@@ -1839,7 +1861,6 @@ local TRANSLIT = {
 }
 
 local cfg
-local gangSetup
 local map, tagOf, mapCount = {}, {}, 0   -- map[tagIdx] = sid, tagOf[sid] = tagIdx
 local gangs = {}                         -- gangs[sid] = { o, c, cd (epoch), cdp (dokladnosc s), z, t }
 local snapshotAt = 0
@@ -1857,11 +1878,7 @@ local events = {}                        -- ostatnie komunikaty (menu)
 -- util
 ------------------------------------------------------------------------
 
-local function toInt32(v)
-    v = v % 0x100000000
-    return v >= 0x80000000 and v - 0x100000000 or v
-end
-
+local toInt32 = A.toInt32
 local stripColors = A.stripColors
 
 local function clean(s)
@@ -1929,11 +1946,6 @@ end
 
 local function sampReady()
     return A.ready and type(isSampAvailable) == 'function' and A.sampReady()
-end
-
-local function chatBlocked()
-    local ok, r = pcall(function() return sampIsChatInputActive() or sampIsDialogActive() end)
-    return ok and r
 end
 
 local function pushEvent(text)
@@ -2354,7 +2366,6 @@ local function load()
     end
     cfg.chatMsgs, cfg.notifyUnlock, cfg.notifyChanges = false, false, false
     cfg.myGang = A.trim(cfg.myGang)
-    if cfg.myGang == '' then cfg.myGang = DEFAULTS.myGang end
     sanitize()
     save()
 end
@@ -2615,7 +2626,7 @@ local function buildHud()
         out[2] = '{AAAAAA}ustaw gang w menu'
     else
         if targetIdx then
-            local sid, g = tagInfo(targetIdx)
+            local _, g = tagInfo(targetIdx)
             out[#out + 1] = ('{33FF66}teraz {FFFFFF}%s {%s}%s {AAAAAA}%d m%s%s'):format(
                 g.z or '?', hex(g.c), gangTag(g.o), floor(dist2d(targetIdx, px, py) + 0.5),
                 stats.ready > 1 and ('  +' .. (stats.ready - 1)) or '', tpTag(targetIdx))
@@ -4009,6 +4020,10 @@ local function gbStart()
     if not zmod() then
         return A.say('Gang', 'Strefy Bot: wlacz modul Strefy.', 'FF6666')
     end
+    local sz = zmod()
+    if sz.gangSet and not sz.gangSet() then
+        A.say('Gang', 'Strefy Bot: ustaw nazwe gangu (Gang > Strefy) - bez niej nie odrozni naszych stref.', 'FFD24A')
+    end
     GB.on, GB.state, GB.why = true, 'pick', ''
     MV.noBike, MV.state, MV.ft, MV.drv = {}, nil, nil, nil
     MV.nrgNext = 0
@@ -4153,7 +4168,6 @@ end
 function M.onKey(vk) GBX.key(vk) end
 
 function M.frame(now)
-    if not A.menuOpen then gangSetup = nil end
     runAuto()
     if now >= nextDialog then
         nextDialog = now + 0.1
@@ -4200,12 +4214,13 @@ function M.status()
     return ('%d/%d, do przejecia %d, blipow %d'):format(mapCount, SERVER_TAGS, stats.ready, countActive())
 end
 
+function M.setupHint() return cfg.myGang == '' and 'Gang > Opcje: tag gangu' or nil end
+
 ------------------------------------------------------------------------
 -- menu
 ------------------------------------------------------------------------
 
 local listMode = 1   -- 1 do przejecia, 2 wszystkie
-local gangBuf
 local soonAt = -1e9
 
 local function graffitiTable(px, py, h)
@@ -4259,7 +4274,7 @@ local function graffitiTable(px, py, h)
 end
 
 function M.menu()
-    local im, ui = A.imgui, A.ui
+    local ui = A.ui
     local px, py
     if isPlayerPlaying(PLAYER_HANDLE) then px, py = getCharCoordinates(PLAYER_PED) end
     local t = A.now()
@@ -4281,19 +4296,12 @@ function M.menu()
         })
     end)
 
-    if gangSetup == nil then gangSetup = (cfg.myGang == '') end
     ui.cols(function()
         ui.group('Opcje', function()
-            if gangSetup then
-                if not gangBuf then
-                    gangBuf = im.new.char[64]()
-                    A.ffi.copy(gangBuf, A.u8(cfg.myGang):sub(1, 63))
-                end
-                ui.textDim('Fragment nazwy Twojego gangu (np. CWL)')
-                if ui.input('##grfgang', 'np. CWL', gangBuf, 64, 0) then
-                    set('myGang', A.trim(A.cp(A.ffi.string(gangBuf))))
-                end
-            end
+            ui.textField('Moj gang##grf', function() return cfg.myGang end, function(v) set('myGang', v) end,
+                { hint = 'np. CWL', size = 64,
+                  tip = 'Fragment nazwy Twojego gangu (najlepiej tag, np. CWL). Po nim skrypt odroznia nasze graffiti od cudzych.' })
+            if cfg.myGang == '' then ui.wrap('Ustaw gang - bez niego nie wiadomo, ktore graffiti mozna przejac.', 0xFFFFD24A) end
             ui.checks({
                 { 'Radar##grf', function() return cfg.enabled end, function(v) set('enabled', v) end,
                   'Graffiti jako kolorowe punkty na radarze. Kolor = gang, ktory je ma.' },
@@ -4332,8 +4340,8 @@ local LOG_FILE = A.DIR .. '\\strefy_log.txt'
 
 local C = {
     discord   = true,
-    webhook   = '',
-    gang      = 'imperium orczych bagniakow CWL',                                 -- nazwa gangu do embedow
+    webhook   = '',            -- https://discord.com/api/webhooks/<id>/<token> - ustawiany w menu
+    gang      = '',            -- pelna nazwa gangu (embedy, rozpoznawanie naszych stref)
     footer    = 'PMS Zone & Graffiti Watcher',
     captureSec = 60,           -- odliczanie w embedzie o ataku
     cooldown  = 60,            -- to samo zdarzenie (typ + gang + strefa): max 1 raz na tyle sekund
@@ -4353,7 +4361,6 @@ local LOG_MAX_BYTES = 1024 * 1024
 local CONT_END, CONT_START = '\172', '\187'   -- serwer tnie dlugie komunikaty (CP1250)
 local RECENT_MAX = 25
 
-local setupOpen, whBuf, gnBuf = nil, nil, nil
 local recent = {}                              -- ostatnie wpisy logu (menu)
 local stats = { ok = 0, fail = 0, events = 0 }
 
@@ -4403,6 +4410,13 @@ local function cleanText(s)
 end
 
 local function clip(s, n) return #s > n and s:sub(1, n) or s end
+
+-- webhook trafia do linii polecen curl / PowerShell: tylko scisly format, bez cudzyslowow i spacji
+local function webhookOk(url)
+    url = tostring(url or '')
+    return url:match('^https://[%w%.%-]*discord%.com/api/webhooks/%d+/[%w_%-]+$') ~= nil
+        or url:match('^https://[%w%.%-]*discordapp%.com/api/webhooks/%d+/[%w_%-]+$') ~= nil
+end
 
 -- ------------------------------------------------------------ parsery (formaty z logu samp.gg)
 -- "Strefa Idlewood (8) nalezaca do Twojego gangu zostala zaatakowana przez goldapia67 67!"
@@ -4549,6 +4563,11 @@ function BUILD.stracona(events)
     end), COLOR_LOST)
 end
 
+function BUILD.test()
+    return wrapEmbed('\\u2705 antek.cc - test webhooka',
+        'Alerty o strefach gangu **' .. jsonEsc(gangLabel()) .. '** beda trafiac na ten kanal.', COLOR_DEFENDED)
+end
+
 -- ------------------------------------------------------------ wysylka (kolejka, 429, curl -> PowerShell)
 local outbox, inflight = {}, nil
 local lastLaunch, sendIdx = -100, 0
@@ -4563,13 +4582,17 @@ local function removeSendFiles(n)
     os.remove(fpath(n, 'code', 'txt'))
 end
 
-local function enqueueSend(json, label, detected)
+local webhookWarned = false
+local function enqueueSend(payload, label, detected)
     if not C.discord then return end
-    if not C.webhook:find('^https://') then
-        logf('Brak poprawnego webhooka - nie wysylam: ' .. label)
+    if not webhookOk(C.webhook) then
+        if not webhookWarned then
+            webhookWarned = true
+            logf('Brak poprawnego webhooka (Gang > Strefy > Discord) - alerty nie sa wysylane.')
+        end
         return
     end
-    outbox[#outbox + 1] = { json = json, label = label, tries = 0, notBefore = 0, detected = detected or os.clock() }
+    outbox[#outbox + 1] = { json = payload, label = label, tries = 0, notBefore = 0, detected = detected or os.clock() }
 end
 
 local function retryLater(p, why, delay)
@@ -4616,6 +4639,10 @@ local function launchNext()
     if c - lastLaunch < SEND_GAP or c < outbox[1].notBefore then return end
 
     local p = table.remove(outbox, 1)
+    if not webhookOk(C.webhook) then
+        logf('Webhook niepoprawny - pomijam: ' .. p.label)
+        return
+    end
     sendIdx = sendIdx % 20 + 1
     p.n = sendIdx
     removeSendFiles(p.n)
@@ -4777,7 +4804,7 @@ end
 local CAPTURE = 60
 local ATT_LAG = 1.0                             -- komunikat o ataku przychodzi ok. 1 s po starcie odliczania na serwerze
 local ATT = {}                                  -- { zone, t0 } - aktywne przejecia
-local attFont, zoneFont
+local attFont
 local unknownLogged = 0
 
 local function gangTag()
@@ -5238,7 +5265,6 @@ function M.init()
 end
 
 function M.frame()
-    if not A.menuOpen then setupOpen = nil end
     local tnow = A.now()
     pcall(drawAttackHud, tnow)
     pcall(drawEnemyHud, tnow)
@@ -5299,9 +5325,10 @@ function M.frame()
     launchNext()
 end
 
+-- haki dla tests/run.lua (parsery bez gry)
 M.test = { detect = function(c) return detectOwnAttack(c) end, attacks = function() return ATT end, enemy = function() return EN end,
     event = function(k, a, z) return enemyEvent(k, a, z) end, zones = function() return ZONES end,
-    chat = function(c) return zoneChat(c) end, parse = function(t) return parseZoneRows(t) end }
+    chat = function(c) return zoneChat(c) end, parse = function(t) return parseZoneRows(t) end, webhookOk = webhookOk }
 
 -- API dla Strefy Bota
 M.zones = function() return ZONES end
@@ -5317,6 +5344,9 @@ M.lock = function(id, sec)
     s.lockUntil = os.time() + sec
 end
 M.setMine = function(id) zset(id, true, gangLabel(), 'bot') end
+M.gangSet = function() return C.gang ~= '' end
+
+function M.setupHint() return C.gang == '' and 'Gang > Strefy: nazwa gangu' or nil end
 
 function M.disable()
     chatQueue, batch, ATT, EN = {}, {}, {}, {}
@@ -5336,9 +5366,10 @@ end
 
 function M.menuGroup()
     local ui, im = A.ui, A.imgui
-    if setupOpen == nil then setupOpen = (C.webhook == '' or C.gang == '') end
-    ui.check('StrefaAlert', function() return C.discord end, function(v) C.discord = v; save() end,
-        'Wysyla na Discorda alerty, gdy ktos atakuje Twoja strefe, gdy ja stracisz albo obronisz.')
+    ui.textField('Nazwa gangu##sz', function() return C.gang end, function(v) C.gang = v; save() end,
+        { size = 96, hint = 'np. Imperium CWL',
+          tip = 'Pelna nazwa Twojego gangu, jak na serwerze. Uzywana w alertach Discord i do rozpoznawania naszych stref '
+              .. '(wystarczy tez tag na koncu nazwy, np. "... CWL").' })
     ui.check('HUD ataku', function() return C.attackHud end, function(v) C.attackHud = v; save() end,
         'Gdy Twoj gang zaczyna przejmowac strefe: nazwa strefy i odliczanie 60 s. Przeciagniesz go, gdy menu jest otwarte.')
     ui.check('HUD wroga', function() return C.enemyHud end, function(v) C.enemyHud = v; save() end,
@@ -5356,7 +5387,7 @@ function M.menuGroup()
     ui.buttons({
         { 'Odswiez /strefy', function() M.refresh() end, 'Otwiera /strefy w tle i czyta, czyja jest kazda strefa i kiedy mozna ja zaatakowac.' },
         { (M.showZones and 'Ukryj' or 'Pokaz') .. ' liste', function() M.showZones = not M.showZones end,
-          'Kazda strefa: czyja jest, kiedy mozna ja przejac i najblizszy teleport.' },
+          'Kazda strefa: czyja jest i kiedy mozna ja przejac.' },
     })
     if M.showZones then
         local ids = {}
@@ -5373,6 +5404,27 @@ function M.menuGroup()
             else txt, col = '?', 0xFF8A8A96 end
             ui.kv(A.u8(z.name) .. ' (' .. id .. ')', A.u8(txt), col)
         end
+    end
+
+    im.Spacing()
+    ui.check('Alerty Discord', function() return C.discord end, function(v) C.discord = v; save() end,
+        'Wysyla na Discorda alerty, gdy ktos atakuje Twoja strefe, gdy ja stracisz albo obronisz.')
+    if not C.discord then return end
+    ui.textField('Webhook##sz', function() return C.webhook end, function(v)
+        if v ~= '' and not webhookOk(v) then
+            A.say('Strefy', 'To nie jest webhook Discorda (https://discord.com/api/webhooks/...).', 'FF6666')
+            return
+        end
+        C.webhook, webhookWarned = v, false
+        save()
+    end, { full = true, password = true, size = 192, hint = 'https://discord.com/api/webhooks/...',
+           tip = 'Discord: Ustawienia kanalu > Integracje > Webhooki > Kopiuj URL. Zapisuje sie po Enter.' })
+    local ok = webhookOk(C.webhook)
+    ui.kv('Webhook', ok and 'ustawiony' or 'brak', ok and 0xFF33FF66 or 0xFFFF6666)
+    ui.kv('Wyslane / bledy', ('%d / %d%s'):format(stats.ok, stats.fail, #outbox > 0 and ('  (kolejka ' .. #outbox .. ')') or ''))
+    if ok and ui.button('Wyslij test##sz', nil, 'Wysyla na kanal probna wiadomosc - sprawdzisz, czy alerty dochodza.') then
+        enqueueSend(BUILD.test(), 'test', os.clock())
+        A.say('Strefy', 'Test wyslany - wynik w moonloader\\config\\antek\\strefy_log.txt.', '7FD07F')
     end
 end
 
@@ -5420,7 +5472,6 @@ local CFG = {
     enable = false, hud = false, rail = true,
     wide = true,          -- trasa szerokosci bili
     discrete = true,      -- poprawka na krok fizyki przy styku
-    aimSource = 3,        -- 1 heading, 2 gracz->biala, 3 kij
     stickFlip = true, axisSwap = true, headingSign = 1.0,
     maxDepth = 2, maxBounces = 3, railE = 0.75, phyDt = 0.021, ballR = 0.0375,
     tdSource = 0,         -- 0 auto, 1 samp.events, 2 odczyt textdrawow
@@ -5471,12 +5522,12 @@ local REC    = { phase = 0, t0 = 0, pred = nil, cueStart = nil }
 local FONT   = nil
 local BX, BY = 30, 300                 -- lewy gorny rog HUD-a (przeciagany)
 local DIAG_AT = nil
-local lastInfo = nil                   -- ostatni wynik diagnostyki (menu)
+local lastInfo = nil                   -- ostatni wynik "Zmierz bile" (menu)
 
 local POWER = {
     cands = {}, tdId = nil, bgId = nil, bgWidth = nil,
     value = 0, raw = 0, charging = false, released = nil, lastUpdate = 0,
-    obsMax = nil, calibrated = false, spy = false, atTable = false,
+    obsMax = nil, calibrated = false, atTable = false,
     speedSamples = {}, distSamples = {},
     scaleFallback = 58.0, lead = 0.10,
     rate = nil, rateT = nil, rateW = nil,
@@ -6506,7 +6557,7 @@ local function mouseMoveX(dx)
     pcall(function() A.ffi.C.mouse_event(0x0001, v, 0, 0, 0) end)       -- MOUSEEVENTF_MOVE
 end
 
-local function autoRotate(pl, now, e)
+local function autoRotate(now, e)
     if now < ROT.nextAt then return end
     ROT.nextAt = now + 0.06
     if ROT.lastU and ROT.lastDx ~= 0 then
@@ -6562,7 +6613,7 @@ local function autoPlay(aiming, now)
     if CFG.autoAim and aiming and not AUTO.down and not RM.down then
         local planKey = tostring(pl.t.obj) .. ':' .. fmt('%.2f', pl.p[1]) .. fmt('%.2f', pl.p[2])      -- ta sama kula i luza = ten sam plan
         if ROT.planT ~= planKey then ROT.planT, ROT.steps, ROT.e0, ROT.locked = planKey, 0, abs(e), false end
-        autoRotate(pl, now, e)
+        autoRotate(now, e)
     end
     if abs(e) < 0.4 then AUTO.alignedSince = AUTO.alignedSince or now else AUTO.alignedSince = nil end
     if not CFG.autoShoot then
@@ -6771,11 +6822,6 @@ end
 
 local function onShowTextDraw(id, td)
     if type(td) ~= 'table' or type(td.lineWidth) ~= 'number' then return end
-    if POWER.spy then
-        local pos = td.position
-        A.log('bilard', fmt('[spy] id=%d line=%.2f,%.2f pos=%.1f,%.1f text=%q', id, td.lineWidth,
-            td.lineHeight or -1, pos and pos.x or -1, pos and pos.y or -1, tostring(td.text)))
-    end
 
     local bar = tdMatches(td, TD_BAR)
     if bar or tdMatches(td, TD_LABEL) or tdMatches(td, TD_FRAME) then
@@ -6906,7 +6952,7 @@ local NUM_FIELDS = {
     {TBL, 'HX', 0.20, 1.50}, {TBL, 'HY', 0.40, 3.00}, {TBL, 'OFF_X', -0.30, 0.30}, {TBL, 'OFF_Y', -0.30, 0.30},
     {TBL, 'POCKET_R', 0.01, 0.30}, {TBL, 'OUT_CORNER', -0.10, 0.30}, {TBL, 'OUT_MID', -0.10, 0.30},
     {CFG, 'ballR', 0.01, 0.15}, {CFG, 'railE', 0.10, 1.00}, {CFG, 'phyDt', 0.001, 0.20},
-    {CFG, 'aimSource', 1, 3}, {CFG, 'aimSrc', 0, 4}, {CFG, 'maxBounces', 0, 10}, {CFG, 'tdSource', 0, 2}, {POWER, 'lead', 0.0, 1.0},
+    {CFG, 'aimSrc', 0, 4}, {CFG, 'maxBounces', 0, 10}, {CFG, 'tdSource', 0, 2}, {POWER, 'lead', 0.0, 1.0},
 }
 local BOOL_FIELDS = { {CFG, 'diag'}, {CFG, 'mig14'}, {CFG, 'plan'}, {CFG, 'autoAim'}, {CFG, 'autoShoot'}, {CFG, 'stickFlip'}, {CFG, 'axisSwap'}, {CFG, 'enable'}, {CFG, 'hud'}, {CFG, 'rail'},
     {CFG, 'wide'}, {CFG, 'discrete'} }
@@ -6958,7 +7004,7 @@ local function loadConfig()
         local v = d[OWNER[f[1]] .. f[2]]
         if type(v) == 'boolean' then f[1][f[2]] = v end
     end
-    CFG.aimSource, CFG.maxBounces, CFG.tdSource = floor(CFG.aimSource), floor(CFG.maxBounces), floor(CFG.tdSource)
+    CFG.aimSrc, CFG.maxBounces, CFG.tdSource = floor(CFG.aimSrc), floor(CFG.maxBounces), floor(CFG.tdSource)
     local function take(dst, src, n)
         if type(src) ~= 'table' then return end
         for _, s in ipairs(src) do
@@ -7130,7 +7176,6 @@ function M.frame(now)
     end
 end
 
-M.planShot = planShot
 function M.disable()
     if AUTO.down then rmb(false); AUTO.down = false end
     saveConfig()
@@ -7194,10 +7239,11 @@ function M.menu()
             ui.sliderFloat('Boki', function() return TBL.OUT_MID end,
                 chg(function(v) TBL.OUT_MID = v; rebuildPockets() end), -0.05, 0.15, '%.3f')
             ui.sliderFloat('Sprezystosc', function() return CFG.railE end, chg(function(v) CFG.railE = v end), 0.1, 1.0, '%.2f')
-            if ui.button('Zmierz bile') then
+            if ui.button('Zmierz bile', nil, 'Mierzy promien bili z najblizszych dwoch bil na stole (stoj przy stole).') then
                 local r = measureRadius()
                 if r then CFG.ballR = r; saveSoon = true end
             end
+            if lastInfo then ui.wrap(lastInfo, 0xFF8A8A96) end
         end)
         ui.group('Celowanie', function()
             local q = srcQuality(AIM.src)
@@ -7207,6 +7253,16 @@ function M.menu()
             ui.check('Odwroc kij', function() return CFG.stickFlip end, chg(function(v) CFG.stickFlip = v end))
             ui.check('Obroc stol o 90', function() return CFG.axisSwap end, chg(function(v) CFG.axisSwap = v; Frame.t = -1e9 end))
         end)
+        if CFG.diag then
+            ui.group('Diagnostyka', function()
+                ui.textDim('Wynik na czacie. Stoj przy stole.')
+                ui.buttons({
+                    { 'Stol##pd', diagTable, 'Pozycja i obrot stolu, odchylka luz od wzorca z pool.pwn.' },
+                    { 'Bile##pd', diagBalls, 'Wszystkie bile w promieniu 5 m z pozycja na stole.' },
+                    { 'Tor##pd', diagWhy, 'Dla kazdej bili: czy tor bialej ja zahaczy, minie czy fizyka ja przeskoczy.' },
+                })
+            end)
+        end
     end)
 end
 
@@ -7214,26 +7270,13 @@ return M
 end)(A))
 
 -- ============================================================================
--- MODUL: SAMPGPT 4.6 (Gemini) - oryginal z drobnymi zmianami pod antek.cc
+-- MODUL: SAMPGPT 4.6 (Gemini) - asystent AI: /ai, quizy i rebusy z czatu/ekranu, OX, mapa z pamieci gry
+-- Wszystko w menu antek.cc (zakladka SAMPGPT). Na czacie: /ai <pytanie>.
 -- ============================================================================
 A.register((function(A)
 
--- Plik jest celowo w 100% ASCII (bez polskich znakow), zeby kodowanie pliku
--- nie mialo znaczenia dla MoonLoadera.
---
--- Wszystko w menu antek.cc (Insert > SAMPGPT). Na czacie zostalo /ai <pytanie>.
-
-pcall(require, 'moonloader')
-
-local ffi = require 'ffi'
-local bit = require 'bit'
-
---------------------------------------------------------------------------------
--- WLASNY JSON (nie zalezy od moonloader/lib/json.lua - rozne wersje tej
--- biblioteki maja rozne API i przez to odpowiedzi z Gemini sie nie czytaly)
---------------------------------------------------------------------------------
-
-local json = A.json
+local ffi, bit = A.ffi, A.bit
+local json = A.json            -- wlasny JSON z core (nie zalezy od wersji moonloader/lib/json.lua)
 
 local ok_encoding, encoding = pcall(require, 'encoding')
 local u8 = nil
@@ -7328,7 +7371,7 @@ local CONFIG = {
     own_servers = {},
 }
 
-local KEY_FILE = getWorkingDirectory() .. '\\config\\sampgpt_key.txt'
+local KEY_FILE = A.WD .. '\\config\\sampgpt_key.txt'
 
 local SYSTEM = [[
 You are SAMPGPT, a fast AI assistant living inside GTA San Andreas Multiplayer (SA-MP 0.3.7).
@@ -7362,8 +7405,6 @@ local STRUCT_HINT = '\n\nReply exactly in this format: ANSWER | very short expla
 local pending = false          -- zapytanie z komendy / AUTO w toku
 local quiz_pending = false     -- zapytanie quizu (osobno, zeby quiz nie czekal)
 local samp_ready = false
-local sf_loaded = false
-local sf_error = nil
 local ffi_ready = false
 local CURL_EXE = nil
 local request_counter = 0
@@ -7379,7 +7420,6 @@ local chat_history = {}
 local last_answer = nil        -- ostatnia odpowiedz (F11, schowek)
 
 local quiz_enabled = false
-local worker_restarts = 0     -- ile razy watek skanera padl przez blad SF.lua i zostal wznowiony
 -- dane dla panelu: ostatnia odpowiedz, czas, reakcja, licznik z ramki
 local HUD = { display = nil, src = nil, dt = nil, t = -1e9, reaction = nil, won = false, timer = nil, timer_t = -1e9 }
 local quiz_img_until = 0       -- do kiedy obrazek z modelem traktujemy jako zagadke
@@ -7404,19 +7444,9 @@ for _, c in ipairs(COMMANDS) do COMMAND_SET[c] = true end
 -- POMOCNICZE
 --------------------------------------------------------------------------------
 
-local function now()
-    if type(localClock) == 'function' then
-        local ok, t = pcall(localClock)
-        if ok and type(t) == 'number' then return t end
-    end
-    return os.clock()
-end
-
-local function trim(s)
-    s = tostring(s or '')
-    s = s:gsub('^%s+', ''):gsub('%s+$', '')
-    return s
-end
+local now, trim = A.now, A.trim
+local read_file, write_file, file_exists = A.readFile, A.writeFile, A.fileExists
+local strip_colors = A.stripColors
 
 local function safe_call(fn, ...)
     if type(fn) ~= 'function' then return nil end
@@ -7425,25 +7455,9 @@ local function safe_call(fn, ...)
     return res[2], res[3], res[4], res[5]
 end
 
-local function read_file(path)
-    local f = io.open(path, 'rb')
-    if not f then return nil end
-    local data = f:read('*a')
-    f:close()
-    return data
-end
-
-local function write_file(path, data)
-    local f = io.open(path, 'wb')
-    if not f then return false end
-    f:write(data)
-    f:close()
-    return true
-end
-
 -- Pamiec miedzy sesjami: ktore modele nie istnieja, jaki poziom myslenia
 -- przyjmuja i gdzie sa screeny. Dzieki temu po starcie gry od razu idzie szybka sciezka.
-local CACHE_FILE = getWorkingDirectory() .. '\\config\\sampgpt_cache.txt'
+local CACHE_FILE = A.WD .. '\\config\\sampgpt_cache.txt'
 
 -- stare wersje trzymaly ustawienia w pliku cache - odczytujemy je jednorazowo
 local OPT_DEFAULTS = { autotype = CONFIG.autotype, autocopy = CONFIG.autocopy, panel = CONFIG.panel, sound = CONFIG.sound }
@@ -7473,38 +7487,41 @@ end
 
 -- USTAWIENIA GRACZA: osobny plik, ktory przetrwa podmiane skryptu na nowa wersje.
 -- Zapisywany przy kazdej zmianie w menu, wczytywany przy starcie.
-local SETTINGS_FILE = getWorkingDirectory() .. '\\config\\sampgpt_ustawienia.txt'
-local SAVED = { -- nazwa w pliku -> pole w CONFIG
+local SETTINGS_FILE = A.WD .. '\\config\\sampgpt_ustawienia.txt'
+local SAVED = { -- nazwa w pliku -> pole w CONFIG (num = kod klawisza VK, reszta 1/0)
     { 'quizy', 'quiz_on_start' }, { 'wpis', 'autotype' }, { 'schowek', 'autocopy' },
     { 'panel', 'panel' }, { 'internet', 'web_search' }, { 'rebus_auto', 'auto_rebus' },
     { 'ox_ekran', 'ox_auto_vision' }, { 'ox_kierunek', 'ox_guide' }, { 'czas', 'show_time' },
     { 'pojazd_ai', 'vehicle_vision_fallback' },
+    { 'klawisz_wpisz', 'key_type', num = true }, { 'klawisz_ox', 'key_ox', num = true }, { 'klawisz_mapa', 'key_map', num = true },
 }
 
 -- folder moonloader\config moze nie istniec - bez niego nic by sie nie zapisalo
-local function ensure_config_dir()
-    local dir = getWorkingDirectory() .. '\\config'
-    if type(createDirectory) == 'function' then
-        pcall(createDirectory, dir)
-    else
-        pcall(function() ffi.C.CreateDirectoryA(dir, nil) end)
-    end
-end
+local function ensure_config_dir() A.mkdir(A.WD .. '\\config') end
 
 local function load_settings()
     local d = read_file(SETTINGS_FILE)
     if not d then return false end
     for name, val in d:gmatch('([%a_]+)%s*=%s*(%S+)') do
         for _, e in ipairs(SAVED) do
-            if e[1] == name then CONFIG[e[2]] = (val == '1' or val:lower() == 'on' or val:lower() == 'tak') end
+            if e[1] == name then
+                if e.num then
+                    local v = tonumber(val)
+                    if v and v >= 0 and v <= 0xFE then CONFIG[e[2]] = math.floor(v) end
+                else
+                    CONFIG[e[2]] = (val == '1' or val:lower() == 'on' or val:lower() == 'tak')
+                end
+            end
         end
     end
     return true
 end
 
 local function save_settings()
-    local out = { '# SAMPGPT - Twoje ustawienia (zmieniaj w grze: Insert > SAMPGPT). 1 = wlaczone, 0 = wylaczone' }
-    for _, e in ipairs(SAVED) do out[#out + 1] = e[1] .. ' = ' .. (CONFIG[e[2]] and '1' or '0') end
+    local out = { '# SAMPGPT - Twoje ustawienia (zmieniaj w grze: menu antek.cc > SAMPGPT). 1 = wlaczone, 0 = wylaczone' }
+    for _, e in ipairs(SAVED) do
+        out[#out + 1] = e[1] .. ' = ' .. (e.num and tostring(CONFIG[e[2]] or 0) or (CONFIG[e[2]] and '1' or '0'))
+    end
     if not write_file(SETTINGS_FILE, table.concat(out, '\r\n') .. '\r\n') then
         ensure_config_dir()
         return write_file(SETTINGS_FILE, table.concat(out, '\r\n') .. '\r\n')
@@ -7526,26 +7543,16 @@ end
 local function temp_dir()
     local t = os.getenv('TEMP') or os.getenv('TMP')
     if t and t ~= '' then return t end
-    return getWorkingDirectory()
+    return A.WD
 end
 
-local function file_exists(path)
-    if type(doesFileExist) == 'function' then
-        local ok, r = pcall(doesFileExist, path)
-        if ok then return r == true end
-    end
-    local f = io.open(path, 'rb')
-    if f then f:close(); return true end
-    return false
-end
-
-local function q(path)
+local function quote(path)
     return '"' .. tostring(path) .. '"'
 end
 
 --------------------------------------------------------------------------------
 -- STATYSTYKI: zadania, wygrane, czas reakcji (zapisywane miedzy sesjami)
-local STATS = { file = getWorkingDirectory() .. '\\config\\sampgpt_staty.txt',
+local STATS = { file = A.WD .. '\\config\\sampgpt_staty.txt',
     d = { zadania = 0, wygrane = 0, reakcje = 0, suma = 0, rekord = 0 } }
 
 function STATS.load()
@@ -7624,10 +7631,6 @@ local function utf8_to_ascii(s)
     s = s:gsub('[\192-\247][\128-\191]*', function(ch) return UTF8_FOLD[ch] or '?' end)
     s = s:gsub('[\128-\255]', '?')
     return s
-end
-
-local function strip_colors(s)
-    return (tostring(s or ''):gsub('{%x%x%x%x%x%x}', ''))
 end
 
 --------------------------------------------------------------------------------
@@ -7715,7 +7718,7 @@ end
 
 -- duzy napis na ekranie (styl GTA)
 local function show_big(text, color, raw)
-    if not raw or type(printStringNow) ~= 'function' then return end
+    if type(printStringNow) ~= 'function' then return end
     local t = raw and text or clean_answer(game_to_utf8(text)):gsub('~', '')
     pcall(printStringNow, (color or '~y~') .. t, 4000)
 end
@@ -7784,99 +7787,18 @@ local function ox_active()
     return now() < ox_until
 end
 
-local function key_name(vk)
-    if not vk or vk == 0 then return 'brak' end
-    if vk >= 0x70 and vk <= 0x7B then return 'F' .. (vk - 0x6F) end
-    return string.format('0x%02X', vk)
-end
+local key_name = A.keyName
 
 --------------------------------------------------------------------------------
--- SF.lua
---------------------------------------------------------------------------------
-
-local function export_module(mod)
-    if type(mod) ~= 'table' then return end
-    for k, v in pairs(mod) do
-        if type(k) == 'string' and type(v) == 'function' and rawget(_G, k) == nil then
-            _G[k] = v
-        end
-    end
-end
-
-local function load_sf()
-    if sf_loaded then return true end
-    if type(sampAddChatMessage) == 'function' and type(sampGetChatString) == 'function' then
-        sf_loaded = true
-        return true
-    end
-    local names = { 'SFlua', 'sflua', 'SF', 'sf', 'SFlua.init', 'sflua.init' }
-    for _, name in ipairs(names) do
-        local ok, mod = pcall(require, name)
-        if ok then
-            export_module(mod)
-            sf_loaded = true
-            return true
-        end
-        local msg = tostring(mod)
-        if not msg:find("module '" .. name .. "' not found", 1, true) then
-            sf_error = msg -- biblioteka jest, ale wywalila blad przy ladowaniu
-        end
-    end
-    local init = getWorkingDirectory() .. '\\lib\\SFlua\\init.lua'
-    if file_exists(init) then
-        local ok, mod = pcall(dofile, init)
-        if ok then
-            export_module(mod)
-            sf_loaded = true
-            return true
-        end
-        sf_error = tostring(mod)
-    end
-    sf_error = sf_error or 'nie znaleziono SF.lua w moonloader\\lib'
-    return false
-end
-
-local function samp_available()
-    if type(isSampAvailable) == 'function' then
-        local ok, r = pcall(isSampAvailable)
-        return ok and r == true
-    end
-    if type(isSampLoaded) == 'function' then
-        local ok, r = pcall(isSampLoaded)
-        return ok and r == true
-    end
-    return nil
-end
-
-local function samp_dll_loaded()
-    if type(getModuleHandle) == 'function' then
-        local ok, h = pcall(getModuleHandle, 'samp.dll')
-        if ok then return h ~= nil and h ~= 0 end
-    end
-    return nil
-end
-
---------------------------------------------------------------------------------
--- FFI (WinAPI) - deklarowane PO zaladowaniu SF.lua, kazda osobno,
--- zeby nie kolidowac z deklaracjami sampapi.
+-- FFI (WinAPI) - tylko to, czego nie deklaruje core (A.initFFI): wyszukiwanie plikow,
+-- base64 (crypt32), folder Dokumenty (shell32). Procesy curl.exe: A.proc.
 --------------------------------------------------------------------------------
 
 local function cdef(s) pcall(ffi.cdef, s) end
 
 local function init_ffi()
     if ffi_ready then return end
-    cdef[[
-        typedef struct {
-            uint32_t cb; char *lpReserved; char *lpDesktop; char *lpTitle;
-            uint32_t dwX; uint32_t dwY; uint32_t dwXSize; uint32_t dwYSize;
-            uint32_t dwXCountChars; uint32_t dwYCountChars; uint32_t dwFillAttribute; uint32_t dwFlags;
-            uint16_t wShowWindow; uint16_t cbReserved2; uint8_t *lpReserved2;
-            void *hStdInput; void *hStdOutput; void *hStdError;
-        } AK_STARTUPINFOA;
-    ]]
-    cdef[[
-        typedef struct { void *hProcess; void *hThread; uint32_t dwProcessId; uint32_t dwThreadId; } AK_PROCESS_INFORMATION;
-    ]]
+    A.initFFI()
     cdef[[ typedef struct { uint32_t dwLowDateTime; uint32_t dwHighDateTime; } AK_FILETIME; ]]
     cdef[[
         typedef struct {
@@ -7886,20 +7808,11 @@ local function init_ffi()
             char cFileName[260]; char cAlternateFileName[14];
         } AK_WIN32_FIND_DATAA;
     ]]
-    cdef[[ int CreateProcessA(const char *app, char *cmd, void *pa, void *ta, int inherit, uint32_t flags, void *env, const char *cwd, AK_STARTUPINFOA *si, AK_PROCESS_INFORMATION *pi); ]]
-    cdef[[ uint32_t WaitForSingleObject(void *h, uint32_t ms); ]]
-    cdef[[ int GetExitCodeProcess(void *h, uint32_t *code); ]]
-    cdef[[ int TerminateProcess(void *h, uint32_t code); ]]
-    cdef[[ int CloseHandle(void *h); ]]
-    cdef[[ uint32_t GetLastError(void); ]]
     cdef[[ void *FindFirstFileA(const char *pattern, AK_WIN32_FIND_DATAA *fd); ]]
     cdef[[ int FindNextFileA(void *h, AK_WIN32_FIND_DATAA *fd); ]]
     cdef[[ int FindClose(void *h); ]]
-    cdef[[ void keybd_event(uint8_t vk, uint8_t scan, uint32_t flags, uintptr_t extra); ]]
     cdef[[ int CryptBinaryToStringA(const char *data, uint32_t len, uint32_t flags, char *out, uint32_t *outlen); ]]
     cdef[[ int SHGetFolderPathA(void *hwnd, int csidl, void *token, uint32_t flags, char *path); ]]
-    cdef[[ int CreateDirectoryA(const char *path, void *security); ]]
-    cdef[[ int IsBadReadPtr(const void *lp, uintptr_t ucb); ]]
 
     local ok1, c32 = pcall(ffi.load, 'crypt32')
     if ok1 then crypt32 = c32 end
@@ -7908,41 +7821,7 @@ local function init_ffi()
     ffi_ready = true
 end
 
--- Procesy (curl.exe) uruchamiane BEZ okna konsoli i BEZ blokowania gry.
-local function proc_spawn(cmdline)
-    local si = ffi.new('AK_STARTUPINFOA')
-    si.cb = ffi.sizeof('AK_STARTUPINFOA')
-    si.dwFlags = 0x00000001   -- STARTF_USESHOWWINDOW
-    si.wShowWindow = 0        -- SW_HIDE
-    local pi = ffi.new('AK_PROCESS_INFORMATION')
-    local buf = ffi.new('char[?]', #cmdline + 1)
-    ffi.copy(buf, cmdline)
-    if ffi.C.CreateProcessA(nil, buf, nil, nil, 0, 0x08000000, nil, nil, si, pi) == 0 then -- CREATE_NO_WINDOW
-        return nil, 'CreateProcess nie zadzialal (kod ' .. tostring(ffi.C.GetLastError()) .. ')'
-    end
-    ffi.C.CloseHandle(pi.hThread)
-    return { h = pi.hProcess }
-end
-
-local function proc_running(p)
-    return p.h ~= nil and ffi.C.WaitForSingleObject(p.h, 0) == 258 -- WAIT_TIMEOUT
-end
-
-local function proc_close(p)
-    if p.h == nil then return nil end
-    local code = ffi.new('uint32_t[1]')
-    ffi.C.GetExitCodeProcess(p.h, code)
-    ffi.C.CloseHandle(p.h)
-    p.h = nil
-    return tonumber(code[0])
-end
-
-local function proc_kill(p)
-    if p.h == nil then return end
-    ffi.C.TerminateProcess(p.h, 1)
-    ffi.C.CloseHandle(p.h)
-    p.h = nil
-end
+local proc_spawn, proc_running, proc_close, proc_kill = A.proc.spawn, A.proc.running, A.proc.finish, A.proc.kill
 
 --------------------------------------------------------------------------------
 -- BASE64
@@ -8194,10 +8073,6 @@ local WEAPON_MODELS = {
     [369] = 'Thermal Goggles', [371] = 'Parachute', [372] = 'Tec-9'
 }
 
-local function vehicle_name(id)
-    return VEHICLE_NAMES[tonumber(id) or -1]
-end
-
 --------------------------------------------------------------------------------
 -- KONTEKST GRY
 --------------------------------------------------------------------------------
@@ -8244,7 +8119,7 @@ local function game_dir()
         local ok, d = pcall(getGameDirectory)
         if ok and type(d) == 'string' and d ~= '' then return d end
     end
-    return (getWorkingDirectory():gsub('\\[^\\]+$', ''))
+    return (A.WD:gsub('\\[^\\]+$', ''))
 end
 
 local function screen_dirs()
@@ -8274,7 +8149,7 @@ local function screen_dirs()
     add(gd .. '\\SAMP\\screens')
     add(gd .. '\\screens')
     add(gd)
-    add(getWorkingDirectory() .. '\\screens')
+    add(A.WD .. '\\screens')
     return dirs
 end
 
@@ -8304,6 +8179,8 @@ local function snapshot(dirs)
 end
 
 local function press_key(vk)
+    -- klawisz wcisniety przez skrypt: rdzen nie traktuje go jak skrotu (F8 = domyslnie Gornik Bot)
+    A.synth = { vk = vk, untilT = A.now() + 0.3 }
     ffi.C.keybd_event(vk, 0, 0, 0)
     wait(30)
     ffi.C.keybd_event(vk, 0, 2, 0) -- KEYEVENTF_KEYUP
@@ -8564,7 +8441,7 @@ end -- screenshot
 
 local function find_curl()
     local windir = os.getenv('WINDIR') or 'C:\\Windows'
-    local wd = getWorkingDirectory()
+    local wd = A.WD
     local candidates = {
         wd .. '\\curl.exe',
         wd .. '\\lib\\curl.exe',
@@ -8611,15 +8488,15 @@ local function api_start(body, model)
     local req = { fin = base .. '_in.json', fout = base .. '_out.json', ferr = base .. '_err.txt', model = model }
     if not write_file(req.fin, body) then return nil, 'Nie mozna zapisac pliku tymczasowego.', true end
     local url = 'https://generativelanguage.googleapis.com/v1beta/models/' .. model .. ':generateContent'
-    local cmd = q(CURL_EXE)
+    local cmd = quote(CURL_EXE)
         .. ' --silent --show-error --connect-timeout 8 --max-time ' .. tostring(CONFIG.request_timeout)
         .. ' -X POST'
         .. ' -H "Content-Type: application/json"'
         .. ' -H "x-goog-api-key: ' .. key .. '"'
-        .. ' --data-binary @' .. q(req.fin)
-        .. ' -o ' .. q(req.fout)
-        .. ' --stderr ' .. q(req.ferr)
-        .. ' ' .. q(url)
+        .. ' --data-binary @' .. quote(req.fin)
+        .. ' -o ' .. quote(req.fout)
+        .. ' --stderr ' .. quote(req.ferr)
+        .. ' ' .. quote(url)
     local p, err = proc_spawn(cmd)
     if not p then
         os.remove(req.fin)
@@ -8860,8 +8737,7 @@ function ask_gemini(o)
                     launch_next()
                 elseif kind == 'empty' or kind == 'invalid' then
                     launch_next()
-                elseif kind == 'net' then
-                else
+                elseif kind ~= 'net' then   -- 'net' (blad sieci jednego modelu): czekamy na pozostale w wyscigu
                     stop_all()
                     return nil, err
                 end
@@ -9409,7 +9285,7 @@ end -- matematyka
 -- BAZA ODPOWIEDZI
 --------------------------------------------------------------------------------
 
-local DB = { file = getWorkingDirectory() .. '\\config\\sampgpt_baza.txt', data = {}, count = 0 }
+local DB = { file = A.WD .. '\\config\\sampgpt_baza.txt', data = {}, count = 0 }
 
 function DB.key(s)
     s = cp1250_to_ascii(tostring(s or '')):lower():gsub('[^%w%s]', ' '):gsub('%s+', ' ')
@@ -9471,7 +9347,7 @@ end
 --------------------------------------------------------------------------------
 
 local KB = {
-    file = getWorkingDirectory() .. '\\config\\sampgpt_wiedza.txt',
+    file = A.WD .. '\\config\\sampgpt_wiedza.txt',
     list = {}, set = {}, tick = 0, last_dialog = nil, MAX = 2000,
     last_cmd = nil, last_cmd_t = -1e9,
 }
@@ -9999,7 +9875,7 @@ local function scramble_ai(tok)
             deliver_answer(ans, dt, { extra = 'rozsypanka ' .. shown })
             set_given('s', key, ans)
         end,
-        on_fail = function(err, rejected)
+        on_fail = function(_, rejected)
             if rejected then
                 chat_print(QUIZ_PREFIX .. '{AAAAAA}rozsypanka ' .. shown .. ': brak pewnej odpowiedzi ('
                     .. clean_answer(rejected):sub(1, 25) .. '?)')
@@ -10700,8 +10576,8 @@ local gz_pool_fn = nil
 local function gangzone_pool()
     if gz_pool_fn == nil then
         gz_pool_fn = false
-        local ok, sampapi = pcall(require, 'sampapi')
-        if ok and type(sampapi) == 'table' and type(sampapi.require) == 'function' then
+        local sampapi = A.sampapi
+        if sampapi and type(sampapi.require) == 'function' then
             local ok2, netgame = pcall(sampapi.require, 'CNetGame', true)
             pcall(sampapi.require, 'CGangZonePool', true)
             if ok2 and netgame then
@@ -10715,7 +10591,7 @@ local function gangzone_pool()
     return nil
 end
 
-function LOC.gang_zones(px, py, h)
+function LOC.gang_zones(px, py)
     local pool = gangzone_pool()
     if not pool then LOC.zones_ok = false; return nil end
     local list = {}
@@ -10794,7 +10670,7 @@ function LOC.scan()
         s.wp = { d = math.sqrt((wx - x) ^ 2 + (wy - y) ^ 2), zone = LOC.zone(wx, wy, wz), city = LOC.city(wx, wy),
             dir = where(x, y, s.h, wx, wy) }
     end
-    s.zones = LOC.gang_zones(x, y, s.h)
+    s.zones = LOC.gang_zones(x, y)
     s.icons = LOC.map_icons(x, y)
     return s
 end
@@ -10824,10 +10700,6 @@ local function icons_text(s, max)
 end
 
 -- LOKALIZATOR GRACZY - dziala na kazdym serwerze.
-function LOC.finder_allowed()
-    return true
-end
-
 local function marker_blips()
     local out = {}
     pcall(function()
@@ -10882,14 +10754,24 @@ end
 
 local FIND_STOP = { gdzie = true, jest = true, jak = true, mam = true, znalezc = true, znajdz = true, gracz = true,
     gracza = true, kolega = true, kolege = true, kolegi = true, moj = true, moja = true, sie = true, the = true }
+local FIND_INTENT = { 'gdzie', 'znajdz', 'znalezc', 'szukam', 'lokaliz', 'pozycj', 'where', 'find' }
+
+-- gracz z pytania: pelny nick zawsze; sam poczatek nicka (>= 3 litery) tylko w pytaniu o lokalizacje,
+-- zeby zwykle pytanie /ai ze slowem pasujacym do czyjegos nicka nie zamienialo sie w szukanie gracza
 function LOC.find_player(question, list)
     local q = cp1250_to_ascii(question):lower()
+    local intent = false
+    for _, w in ipairs(FIND_INTENT) do
+        if q:find(w, 1, true) then intent = true; break end
+    end
     local best, best_len = nil, 0
     for _, p in ipairs(list) do
         local nick = cp1250_to_ascii(p.name):lower()
         if #nick >= 3 and q:find(nick, 1, true) and #nick > best_len then best, best_len = p, #nick end
-        for w in q:gmatch('[%w_]+') do
-            if #w >= 3 and not FIND_STOP[w] and nick:sub(1, #w) == w and #w > best_len then best, best_len = p, #w end
+        if intent then
+            for w in q:gmatch('[%w_]+') do
+                if #w >= 3 and not FIND_STOP[w] and nick:sub(1, #w) == w and #w > best_len then best, best_len = p, #w end
+            end
         end
     end
     return best
@@ -11005,7 +10887,8 @@ do
 
 local function cmd_aihelp()
     local gr = '{AAAAAA}'
-    chat_print(PREFIX .. 'Wszystko jest w menu: ' .. A.keyName(A.cfg.menuKey) .. ' > SAMPGPT.' .. gr .. ' Na czacie: /ai <pytanie>')
+    chat_print(PREFIX .. 'Wszystko jest w menu: ' .. A.comboName(A.cfg.menuKey, A.cfg.menuMods) .. ' > SAMPGPT.' .. gr
+        .. ' Na czacie: /ai <pytanie>')
     chat_print(PREFIX .. key_name(CONFIG.key_type) .. gr .. ' wpisz odpowiedz  {FFFFFF}' .. key_name(CONFIG.key_ox)
         .. gr .. ' OX z ekranu  {FFFFFF}' .. key_name(CONFIG.key_map) .. gr .. ' mapa: strefy i okolica')
 end
@@ -11101,7 +10984,7 @@ end
 local function cmd_aistatus()
     local key_ok = get_api_key() ~= ''
     local problems = {}
-    if not sf_loaded then problems[#problems + 1] = 'brak SF.lua' end
+    if not A.sf then problems[#problems + 1] = 'brak SF.lua' end
     if not CURL_EXE then problems[#problems + 1] = 'brak curl.exe' end
     if not key_ok then problems[#problems + 1] = 'brak klucza API' end
     chat_print(PREFIX .. (#problems == 0 and '{33FF33}Wszystko dziala' or ('{FF6666}' .. table.concat(problems, ', ')))
@@ -11113,9 +10996,9 @@ local function cmd_aistatus()
         .. ' | szukanie graczy ON')
     chat_print(PREFIX .. 'baza ' .. DB.count .. ' | wiedza ' .. #KB.list .. ' | zadania ' .. d.zadania
         .. ' | wygrane ' .. d.wygrane .. (avg and string.format(' | reakcja %.2f s (rekord %.2f)', avg, d.rekord) or ''))
-    if not sf_loaded and sf_error then chat_print(WARN_PREFIX .. 'SF: ' .. sf_error:sub(1, 100)) end
-    if worker_restarts > 0 then
-        chat_print(INFO_PREFIX .. 'Bledy SF.lua przechwycone: ' .. worker_restarts .. 'x (skrypt dziala dalej)')
+    if not A.sf and A.sfErr then chat_print(WARN_PREFIX .. 'SF: ' .. tostring(A.sfErr):sub(1, 100)) end
+    if A.restarts > 0 then
+        chat_print(INFO_PREFIX .. 'Bledy SF.lua przechwycone: ' .. A.restarts .. 'x (skrypt dziala dalej)')
     end
 end
 
@@ -11145,6 +11028,7 @@ end
 end -- komendy
 
 local function queue_command(cmd, arg)
+    if not A.isOn('gpt') then return end
     cmd = tostring(cmd):lower()
     arg = tostring(arg or '')
     local key = cmd .. '\0' .. arg
@@ -11181,8 +11065,9 @@ local function chat_or_dialog_open()
     return false
 end
 
-addEventHandler('onWindowMessage', function(msg, wparam, lparam)
-    if not samp_ready then return end
+-- Enter w czacie: /ai obslugujemy sami (bez wysylania na serwer) + pomiar czasu reakcji w quizach
+addEventHandler('onWindowMessage', function(msg, wparam)
+    if not samp_ready or not A.isOn('gpt') then return end
     if msg == 0x0102 and wparam == 0x0D and swallow_enter_char then
         swallow_enter_char = false
         if type(consumeWindowMessage) == 'function' then consumeWindowMessage(true, false) end
@@ -11223,12 +11108,6 @@ end
 --------------------------------------------------------------------------------
 -- MAIN
 --------------------------------------------------------------------------------
-
-addEventHandler('onScriptTerminate', function(scr)
-    if type(thisScript) == 'function' and scr == thisScript() then
-        pcall(cancel_all_requests)
-    end
-end)
 
 local ox_font = nil
 local function draw_ox_marker()
@@ -11291,8 +11170,7 @@ local function draw_panel()
     if timer and fresh then
         lines[#lines + 1] = { '{FFCC00}zostalo ' .. HUD.timer .. ' s', panel_font }
     end
-    local sw, sh = 1280, 720
-    if type(getScreenResolution) == 'function' then sw, sh = getScreenResolution() end
+    local sw = A.sw
     local pad, w, h, hs = 8, 0, 0, {}
     for i, l in ipairs(lines) do
         local plain = strip_colors(l[1])
@@ -11319,41 +11197,10 @@ local function key_pressed(vk)
     return ok and r == true
 end
 
-local workers = {}
-
-local function start_worker(name, body)
-    local w = { name = name, fails = 0, next_restart = 0 }
-    w.th = lua_thread.create(function()
-        while true do
-            local ok, err = pcall(body)
-            if not ok then
-                print('[SAMPGPT] blad w watku ' .. name .. ': ' .. tostring(err))
-                wait(1000)
-            end
-        end
-    end)
-    workers[#workers + 1] = w
-end
-
-local function thread_alive(th)
-    local ok, st = pcall(function() return th:status() end)
-    if not ok then return true end
-    return st ~= 'dead' and st ~= 'error'
-end
-
-local function supervise()
-    local t = now()
-    for _, w in ipairs(workers) do
-        if not thread_alive(w.th) and t >= w.next_restart then
-            w.fails = w.fails + 1
-            worker_restarts = worker_restarts + 1
-            w.next_restart = t + math.min(10, w.fails)
-            print('[SAMPGPT] watek "' .. w.name .. '" padl (blad SF.lua) - wznawiam (' .. w.fails .. ')')
-            pcall(function() w.th:run() end)
-        end
-    end
+-- zadanie AI, ktorego watek padl bledem SF.lua (pcall go nie zlapal): zwolnij blokade
+local function reap_jobs()
     for job in pairs(jobs) do
-        if not job.done and not thread_alive(job.th) then
+        if not job.done and not A.threadAlive(job.th) then
             jobs[job] = nil
             if job.quiz then quiz_pending = false else pending = false end
         end
@@ -11389,7 +11236,13 @@ end
 --------------------------------------------------------------------------------
 
 local M = { id = 'gpt', title = 'SAMPGPT' }
-local keySetup, keyBuf = nil, nil
+local keyCache, keyCacheAt = '', -1e9
+
+-- klucz do menu: plik czytany najwyzej co 2 s, nie co klatke
+local function cached_key()
+    if now() - keyCacheAt > 2 then keyCache, keyCacheAt = get_api_key(), now() end
+    return keyCache
+end
 
 function M.init()
     ensure_config_dir()
@@ -11399,28 +11252,22 @@ function M.init()
     DB.load()
     STATS.load()
     KB.load()
-    load_sf()
+    A.loadSF()
     init_ffi()
     samp_ready = true
     register_commands()
     CURL_EXE = find_curl()
     quiz_enabled = CONFIG.quiz_on_start
-    if not sf_loaded then chat_print(ERR_PREFIX .. 'SF.lua nie zaladowany - szczegoly w menu.') end
-    if not CURL_EXE then chat_print(ERR_PREFIX .. 'Nie znaleziono curl.exe.') end
-    local function gated(fn)
-        return function()
-            if A.isOn('gpt') then fn() else wait(250) end
-        end
-    end
-    start_worker('komendy', gated(worker_input))
-    start_worker('ramki', gated(worker_td))
-    start_worker('wiedza', gated(worker_chat))
+    if not A.sf then chat_print(ERR_PREFIX .. 'SF.lua nie zaladowany - szczegoly w moonloader.log.') end
+    if not CURL_EXE then chat_print(ERR_PREFIX .. 'Nie znaleziono curl.exe (Windows 10+ ma go w System32).') end
+    A.worker('gpt-komendy', worker_input, 'gpt')
+    A.worker('gpt-ramki', worker_td, 'gpt')
+    A.worker('gpt-wiedza', worker_chat, 'gpt')
     A.onChat('gpt', on_chat)
 end
 
 function M.frame()
-    if not A.menuOpen then keySetup = nil end
-    supervise()
+    reap_jobs()
     if not A.drawOk then return end
     if ox_marker then pcall(draw_ox_marker) end
     if CONFIG.panel then pcall(draw_panel) end
@@ -11437,37 +11284,58 @@ end
 
 function M.status()
     return 'quizy ' .. onoff(quiz_enabled) .. ', OX ' .. onoff(ox_active())
-        .. (get_api_key() == '' and ', BRAK KLUCZA' or '')
+        .. (cached_key() == '' and ', BRAK KLUCZA' or '')
 end
+
+function M.setupHint() return get_api_key() == '' and 'SAMPGPT: klucz API' or nil end
 
 -- ------------------------------------------------------------ menu
 local UI_OPTS = {
-    { 'autotype', 'Auto wpisywanie', 'Odpowiedz AI sama wpisuje sie w czat i wysyla.' },
+    { 'autotype', 'Auto wpisywanie', 'Odpowiedz AI sama wpisuje sie w czat (zostaje tylko Enter).' },
     { 'autocopy', 'Schowek', 'Odpowiedz AI trafia do schowka (Ctrl+V).' },
-    { 'panel', 'Panel', 'Mala ramka z odpowiedzia AI na ekranie.' },
+    { 'panel', 'Panel', 'Mala ramka z odpowiedzia AI na ekranie. Przeciagniesz ja, gdy menu jest otwarte.' },
     { 'web_search', 'Internet', 'Zwykle pytania /ai moga szukac odpowiedzi w Google (aktualnosci, wyniki, fakty).' },
     { 'auto_rebus', 'Auto rebus', 'Rebusy pojawiajace sie na ekranie rozwiazuja sie same.' },
+    { 'ox_guide', 'OX: kierunek', 'W zabawie OX pokazuje, w ktora strone isc (strefy podpisane napisami 3D).' },
+}
+
+local KEY_OPTS = {
+    { 'key_type', 'Wpisz odpowiedz', 'Wpisuje ostatnia odpowiedz AI w czat (zostaje Enter).' },
+    { 'key_ox', 'OX z ekranu', 'Robi screena i ocenia pytanie OX widoczne teraz na ekranie.' },
+    { 'key_map', 'Mapa', 'Strefy gangow, ikony i gracze w poblizu - z pamieci gry, od razu.' },
 }
 
 function M.menu()
-    local ui, im = A.ui, A.imgui
-    if keySetup == nil then keySetup = (get_api_key() == '') end
+    local ui = A.ui
     ui.cols(function()
-        if keySetup then
-            ui.group('Klucz API', function()
-                if not keyBuf then keyBuf = im.new.char[128]() end
-                ui.textDim('Klucz Gemini (aistudio.google.com)')
-                if ui.input('##gptkey', 'AIza...', keyBuf, 128, im.InputTextFlags.Password) then
-                    ensure_config_dir()
-                    write_file(KEY_FILE, trim(A.ffi.string(keyBuf)) .. '\n')
-                end
-            end)
-        end
+        ui.group('Klucz API', function()
+            local key = cached_key()
+            ui.kv('Gemini', key ~= '' and 'ustawiony' or 'brak', key ~= '' and 0xFF33FF66 or 0xFFFF6666)
+            ui.kv('curl.exe', CURL_EXE and 'jest' or 'brak', CURL_EXE and 0xFF33FF66 or 0xFFFF6666)
+            ui.textField('Klucz##gpt', function() return key end, function(v)
+                ensure_config_dir()
+                if v == '' then os.remove(KEY_FILE) else write_file(KEY_FILE, v .. '\n') end
+                keyCacheAt = -1e9
+                A.say('SAMPGPT', v == '' and 'Klucz API usuniety.' or 'Klucz API zapisany.', '66CCFF')
+            end, { full = true, password = true, size = 128, hint = 'AIza...',
+                   tip = 'Darmowy klucz: aistudio.google.com > Get API key. Zapisuje sie po Enter (plik moonloader\\config\\sampgpt_key.txt).' })
+        end)
         ui.group('Quizy', function()
             ui.check('Quizy', function() return quiz_enabled end, function() queue_command('aiquiz', '') end,
                 'AI sam rozwiazuje quizy i rebusy z czatu oraz ramek na ekranie.')
+            ui.check('Tryb OX', function() return ox_active() end, function(v) queue_command('aiox', v and 'on' or 'off') end,
+                'Zabawa prawda/falsz: wlacza sie sama, gdy serwer ja oglosi. Tu mozesz ja wymusic albo wylaczyc.')
+            local d, avg = STATS.d, STATS.avg()
+            ui.kv('Zadania / wygrane', ('%d / %d'):format(d.zadania, d.wygrane))
+            if avg then ui.kv('Reakcja (rekord)', ('%.2f s (%.2f s)'):format(avg, d.rekord)) end
+            ui.kv('Baza / wiedza', ('%d / %d'):format(DB.count, #KB.list))
             A.imgui.Spacing()
-            if ui.button('Rebus', nil, 'Rozwiazuje rebus widoczny teraz na ekranie. Menu zamknie sie, zeby nie zaslaniac obrazu.') then A.setMenu(false); queue_command('rebus', '') end
+            ui.buttons({
+                { 'Rebus', function() A.setMenu(false); queue_command('rebus', '') end,
+                  'Rozwiazuje rebus widoczny teraz na ekranie. Menu zamknie sie, zeby nie zaslaniac obrazu.' },
+                { 'Status', function() A.setMenu(false); queue_command('aistatus', '') end,
+                  'Na czacie: co dziala, ktory model odpowiada, statystyki.' },
+            })
         end)
     end, function()
         ui.group('Opcje', function()
@@ -11478,6 +11346,15 @@ function M.menu()
                 end, o[3])
             end
         end)
+        ui.group('Klawisze', function()
+            for _, o in ipairs(KEY_OPTS) do
+                ui.keyButton(o[2] .. '##gptk', function() return CONFIG[o[1]] end, function(vk)
+                    CONFIG[o[1]] = vk
+                    save_settings()
+                end, o[3], true)
+            end
+            ui.textDim('Na czacie: /ai <pytanie>')
+        end)
     end)
 end
 
@@ -11486,7 +11363,7 @@ end)(A))
 
 -- ============================================================================
 -- MODUL: MAKRO (dawny AutoY.ahk) - szybkie wciskanie klawisza (domyslnie Y)
--- Sterowanie tylko klawiszami (domyslnie Lewo / Prawo). Menu: zakladka Strefy.
+-- Sterowanie tylko klawiszami (domyslnie Lewo / Prawo). Menu: zakladka Boty.
 -- Tempo dobierane samo: wcisniecie i puszczenie trwaja kazde co najmniej jedna
 -- klatke i 18 ms - gra czyta klawiature raz na klatke, wiec kazde wcisniecie
 -- jest zauwazone, a przy 60-100 FPS to ok. 25-30 wcisniec na sekunde (jak w AHK).
@@ -11513,7 +11390,7 @@ local on, down, paused = false, false, false
 local nextFlip, flipFrame, frameNo = 0, -1, 0
 local focused, focusAt = true, 0
 local scan = 0x15
-local font, pid
+local font
 
 local function save() A.saveJson(FILE, C) end
 
@@ -11532,19 +11409,6 @@ local function release()
         key(true)
         down = false
     end
-end
-
--- okno na pierwszym planie nalezy do procesu gry
-local function gameFocused()
-    local ok, r = pcall(function()
-        if not pid then pid = ffi.C.GetCurrentProcessId() end
-        local h = ffi.C.GetForegroundWindow()
-        if h == nil then return false end
-        local p = ffi.new('uint32_t[1]')
-        ffi.C.GetWindowThreadProcessId(h, p)
-        return p[0] == pid
-    end)
-    return not ok or r
 end
 
 local function set(v)
@@ -11576,7 +11440,7 @@ end
 function M.frame(now)
     frameNo = frameNo + 1
     if on then
-        if now >= focusAt then focusAt, focused = now + 0.25, gameFocused() end
+        if now >= focusAt then focusAt, focused = now + 0.25, A.gameFocused() end
         paused = A.menuOpen or A.miningBusy or A.minerAuto or A.zoneBotOn or A.pauseActive() or A.chatInputActive()
             or A.dialogActive() or not focused
         if paused then
@@ -11606,7 +11470,9 @@ end
 function M.disable() set(false) end
 function M.terminate() release() end
 
--- grupa w zakladce Strefy
+function M.status() return on and (paused and 'pauza' or ('wlaczone, ' .. C.rate .. '/s')) or 'wylaczone' end
+
+-- grupa w zakladce Boty
 function M.menuGroup()
     local ui = A.ui
     ui.keyButton('Wlacz', function() return C.keyOn end, function(vk) C.keyOn = vk; save() end,
@@ -12100,8 +11966,6 @@ local recent = {}                          -- ostatnie czasy (ms) od komunikatu 
 local lat = 0.11                           -- srednio: wcisniecie -> nowy komunikat (s)
 local lastPress = { id = nil, t = -1e9 }
 local cfgDirty = false
-local oreTd = { id = nil }
-local oreTextInfo                          -- zdefiniowane ponizej
 local nextDisc = 0
 
 local function save()
@@ -12273,20 +12137,14 @@ local function addPrompt(id, now)
     PR[id] = e
 end
 
--- jeden pelny przeglad textdrawow (co 0.7 s): komunikaty o klawiszu i napis przy skale
+-- jeden pelny przeglad textdrawow (co 0.7 s): komunikaty o klawiszu
 local function discover(now)
     if now < nextDisc then return end
     nextDisc = now + 0.7
     for id = 0, TD_MAX - 1 do
         if sampTextdrawIsExists(id) then
             local ok, text = pcall(sampTextdrawGetString, id)
-            if ok and type(text) == 'string' then
-                if promptKey(text) then
-                    addPrompt(id, now)
-                elseif oreTextInfo and oreTextInfo(text) then
-                    oreTd.id = id
-                end
-            end
+            if ok and type(text) == 'string' and promptKey(text) then addPrompt(id, now) end
         end
     end
 end
@@ -12815,15 +12673,7 @@ local function learnPress(pressed)                          -- pressed: vk (licz
     end
 end
 
-local function median(list)
-    if #list == 0 then return nil end
-    local t = {}
-    for i, v in ipairs(list) do t[i] = v end
-    table.sort(t)
-    return t[math.ceil(#t / 2)]
-end
-
--- ------------------------------------------------------------ diagnostyka (Boty -> Gornik Bot -> Diagnostyka)
+-- ------------------------------------------------------------ diagnostyka (C.diag: wpisy [diag] w moonloader.log)
 local diagTd = { known = nil, nextAt = 0 }
 
 local function nearestSpot(px, py)
@@ -12902,7 +12752,7 @@ end
 -- Trasa: A* po siatce 0.8 m budowanej leniwie z kolizji gry (processLineOfSight / isLineOfSightClear,
 -- budynki + obiekty SA-MP). Liczone po kawalku co klatke (budzet czasu), krawedzie w cache (kopalnia jest
 -- statyczna, kolejne trasy ida z pamieci). Zablokowany = tymczasowa blokada przed postacia + nowa trasa.
-local nmax, nmin, nsqrt, nceil = math.max, math.min, math.sqrt, math.ceil
+local nmin, nsqrt = math.min, math.sqrt
 
 local NV = A.newNav({
     tag = 'gornik',
@@ -13631,11 +13481,7 @@ end
 
 -- znaczniki 3D nad znanymi skalami + blipy na radarze
 local oreBlips, nextBlips, fontOre = {}, 0, nil     -- klucz pozycji -> blip
-
-local function toInt32(v)
-    v = v % 0x100000000
-    return v >= 0x80000000 and v - 0x100000000 or v
-end
+local toInt32 = A.toInt32
 
 local function clearOreBlips()
     for k, b in pairs(oreBlips) do
@@ -13780,6 +13626,11 @@ function M.disable()
     clearOreBlips()
 end
 
+function M.status()
+    if not on then return ('wylaczony, rud widocznych %d'):format(#ore.spots) end
+    return ('%s, rud %d%s'):format(S and S.why or '?', S and S.ores or 0, AP and ', automat' or '')
+end
+
 function M.terminate(quit)
     release()
     A.miningBusy = false
@@ -13848,7 +13699,7 @@ end)(A))
 -- na radarze (50 najblizszych).
 -- ============================================================================
 A.register((function(A)
-local sqrt, min = math.sqrt, math.min
+local min = math.min
 
 local M = { id = 'statuetki', title = 'Statuetki', hidden = true }
 local MODEL, TOTAL = 1276, 100
@@ -13898,19 +13749,18 @@ function A.pickupList(now)
     if A._pk and now - A._pkAt < 0.9 then return A._pk end
     local pool = getPool()
     if not pool then return nil end
+    -- jeden pcall na caly przebieg (bez 4096 domkniec na sekunde); zly slot = koniec odczytu, reszta zostaje
     local list = {}
-    for i = 0, 4095 do
-        local ok, handle = pcall(function() return pool.m_handle[i] end)
-        if not ok then break end
-        if handle ~= 0 then
-            local ok2, e = pcall(function()
-                local obj = pool.m_object[i]
+    pcall(function()
+        local handles, objects = pool.m_handle, pool.m_object
+        for i = 0, 4095 do
+            if handles[i] ~= 0 then
+                local obj = objects[i]
                 local p = obj.m_position
-                return { slot = i, model = obj.m_nModel, typ = obj.m_nType, x = p.x + 0.0, y = p.y + 0.0, z = p.z + 0.0 }
-            end)
-            if ok2 then list[#list + 1] = e end
+                list[#list + 1] = { slot = i, model = obj.m_nModel, typ = obj.m_nType, x = p.x + 0.0, y = p.y + 0.0, z = p.z + 0.0 }
+            end
         end
-    end
+    end)
     A._pk, A._pkAt = list, now
     return list
 end
@@ -14000,6 +13850,8 @@ function M.terminate(quit)
     if not quit then clearBlips() end
 end
 
+function M.status() return ('znalezione %d/%d'):format(#known, TOTAL) end
+
 function M.menuGroup()
     local ui = A.ui
     ui.kv('Znalezione', #known .. ' / ' .. TOTAL, #known >= TOTAL and 0xFF33FF66 or 0xFFFFB347)
@@ -14030,21 +13882,16 @@ local DUMP = A.WD .. '\\walizki_dump.txt'
 local FILE = A.DIR .. '\\walizki.json'
 local MAX_BLIPS = 40
 -- W poblizu gracza serwer zawsze streamuje pickupy/obiekty, wiec brak walizki = podniesiona.
--- Blisko (15 m): 2 kolejne skany (~1 s); do 60 m: 4 skany (~2 s), zeby chwilowy brak streamingu jej nie usunal.
+-- Blisko (15 m): 2 kolejne skany bez niej (~1 s); do 60 m: 4 skany (~2 s), zeby chwilowy brak streamingu jej nie usunal.
 local NEAR_R2, FAR_R2 = 15 * 15, 60 * 60
 local SAME_R2 = 4                 -- ta sama walizka (2 m)
 local BLIP_RGB = 0x33CCFF
 
 local C = { radar = true }
-local known, blips = {}, {}
+local known, blips = {}, {}       -- blips: walizka (tabela z known) -> blip
 local dirty = false
 
 local function save() A.saveJson(FILE, { radar = C.radar }) end
-
-local function toInt32(v)
-    v = v % 0x100000000
-    return v >= 0x80000000 and v - 0x100000000 or v
-end
 
 local function nearKnown(x, y, z)
     for i, k in ipairs(known) do
@@ -14101,25 +13948,34 @@ local function visibleNow(now)
 end
 
 local function clearBlips()
-    for i, b in pairs(blips) do
+    for k, b in pairs(blips) do
         if doesBlipExist(b) then removeBlip(b) end
-        blips[i] = nil
+        blips[k] = nil
     end
 end
 
+-- tylko roznice: podniesione / za daleko traca blip, nowe dostaja; reszta stoi (bez migania radaru)
 local function syncBlips(px, py)
-    clearBlips()
-    if not C.radar or getActiveInterior() ~= 0 then return end
+    if not C.radar or getActiveInterior() ~= 0 then return clearBlips() end
     local order = {}
     for _, k in ipairs(known) do order[#order + 1] = { k = k, d = (k.x - px) ^ 2 + (k.y - py) ^ 2 } end
     table.sort(order, function(a, b) return a.d < b.d end)
-    for n = 1, min(#order, MAX_BLIPS) do
-        local k = order[n].k
-        local ok, h = pcall(addBlipForCoord, k.x, k.y, k.z)
-        if not ok or not h or not doesBlipExist(h) then break end
-        changeBlipDisplay(h, 2)
-        pcall(changeBlipColour, h, toInt32(BLIP_RGB * 256 + 0xFF))
-        blips[n] = h
+    local want = {}
+    for n = 1, min(#order, MAX_BLIPS) do want[order[n].k] = true end
+    for k, b in pairs(blips) do
+        if not want[k] or not doesBlipExist(b) then
+            if doesBlipExist(b) then removeBlip(b) end
+            blips[k] = nil
+        end
+    end
+    for k in pairs(want) do
+        if not blips[k] then
+            local ok, h = pcall(addBlipForCoord, k.x, k.y, k.z)
+            if not ok or not h or not doesBlipExist(h) then break end
+            changeBlipDisplay(h, 2)
+            pcall(changeBlipColour, h, A.toInt32(BLIP_RGB * 256 + 0xFF))
+            blips[k] = h
+        end
     end
 end
 
@@ -14134,7 +13990,7 @@ end
 
 function M.frame(now)
     if not isPlayerPlaying(PLAYER_HANDLE) then return end
-    local px, py, pz = getCharCoordinates(PLAYER_PED)
+    local px, py = getCharCoordinates(PLAYER_PED)
     if now >= nextScan then
         nextScan = now + 0.5
         local seen = visibleNow(now)
@@ -14145,7 +14001,7 @@ function M.frame(now)
                     dirty = true
                 end
             end
-            -- jednorazowa: przy zapamietanym miejscu nie ma juz walizki 3 skany z rzedu = podniesiona
+            -- jednorazowa: przy zapamietanym miejscu nie ma juz walizki 2-4 skany z rzedu = podniesiona
             for i = #known, 1, -1 do
                 local k = known[i]
                 local d2 = (k.x - px) ^ 2 + (k.y - py) ^ 2
@@ -14181,6 +14037,8 @@ function M.terminate(quit)
     if not quit then clearBlips() end
 end
 
+function M.status() return ('znalezione %d'):format(#known) end
+
 function M.menuGroup()
     local ui = A.ui
     ui.kv('Znalezione', #known)
@@ -14199,8 +14057,6 @@ end)(A))
 -- MENU (mimgui) + UI helpery
 -- ============================================================================
 do
-local floor = math.floor
-
 local VK_NAMES = {
     [0x01] = 'LPM', [0x02] = 'PPM', [0x04] = 'SPM', [0x05] = 'Mysz4', [0x06] = 'Mysz5',
     [0x08] = 'Backspace', [0x09] = 'Tab', [0x0D] = 'Enter', [0x10] = 'Shift', [0x11] = 'Ctrl', [0x12] = 'Alt',
@@ -14248,8 +14104,6 @@ A.ui = {}
 local ui = A.ui
 
 if im then
-    local bit = A.bit
-
     -- ------------------------------------------------------------ paleta
     local P = {
         accent  = { 0.66, 0.52, 1.00, 1 },
@@ -14314,6 +14168,13 @@ if im then
         im.PushTextWrapPos(im.GetCursorPosX() + ui.W)
         if argb then im.TextColored(vec4(argb), pct(s)) else im.TextWrapped(pct(s)) end
         im.PopTextWrapPos()
+    end
+
+    -- tekst wyrownany do prawej krawedzi grupy, w tej samej linii co poprzedni element
+    function ui.right(s, argb)
+        s = tostring(s)
+        im.SameLine(10 + ui.W - textW(s))
+        if argb then ui.textCol(argb, s) else ui.textDim(s) end
     end
 
     -- etykieta po lewej, wartosc wyrownana do prawej
@@ -14460,20 +14321,74 @@ if im then
         return r
     end
 
-    -- klawisz: "Etykieta ....... [Insert]"; klik -> nastepny wcisniety klawisz (Esc = anuluj)
-    function ui.keyButton(label, get, set, tip)
+    -- pole tekstowe z wlasnym buforem: pokazuje get(), gdy nie jest edytowane; set(v) po Enter / wyjsciu z pola
+    -- (bez IsItemDeactivatedAfterEdit w starszym mimgui - po kazdej zmianie). v: CP1250, bez spacji na brzegach.
+    -- o = { size, hint, tip, password, full (etykieta nad polem, pole na cala szerokosc) }
+    local texts = {}
+    local deactivatedAfterEdit = lookup('IsItemDeactivatedAfterEdit')
+    function ui.textField(label, get, set, o)
+        o = o or {}
+        local size = o.size or 64
+        local f = texts[label]
+        if not f then
+            f = { buf = im.new.char[size](), size = size }
+            texts[label] = f
+        end
+        if not f.active then
+            local cur = A.u8(get() or ''):sub(1, size - 1)
+            if cur ~= f.shown then
+                f.shown = cur
+                A.ffi.fill(f.buf, size)
+                A.ffi.copy(f.buf, cur)
+            end
+        end
+        local flags = o.password and im.InputTextFlags.Password or 0
+        if o.full then
+            ui.textDim(plain(label))
+            im.PushItemWidth(ui.W)
+        else
+            ui.textDim(plain(label))
+            im.SameLine(10 + ui.W * 0.42)
+            im.PushItemWidth(ui.W * 0.58)
+        end
+        local changed = ui.inputHint('##tf' .. label, o.hint or '', f.buf, size, flags)
+        im.PopItemWidth()
+        f.active = im.IsItemActive()
+        ui.tip(plain(label), o.tip)
+        local commit = changed
+        if deactivatedAfterEdit then commit = deactivatedAfterEdit() == true end
+        if commit then
+            local v = A.trim(A.cp(A.ffi.string(f.buf)))
+            f.shown = nil
+            set(v)
+            return true
+        end
+        return false
+    end
+
+    -- klawisz: "Etykieta ....... [Insert]"; klik -> nastepny wcisniety klawisz (Esc = anuluj);
+    -- clearable: przycisk "x" ustawia 0 (klawisz wylaczony)
+    function ui.keyButton(label, get, set, tip, clearable)
         local id = label
-        local txt = (A.keyCaptureId == id) and '...' or A.keyName(get())
+        local vk = get()
+        local has = vk and vk ~= 0
+        local txt = (A.keyCaptureId == id) and '...' or A.keyName(vk)
         ui.textDim(plain(label))
         im.SameLine(10 + ui.W * 0.42)
-        if im.Button(txt .. '##key' .. id, V2(ui.W * 0.58, 0)) then
+        local w = ui.W * 0.58
+        if clearable and has then w = w - 28 end
+        if im.Button(txt .. '##key' .. id, V2(w, 0)) then
             A.keyCaptureId = id
-            A.keyCapture = function(vk)
+            A.keyCapture = function(k)
                 A.keyCaptureId = nil
-                if vk ~= 0x1B then set(vk) end
+                if k ~= 0x1B then set(k) end
             end
         end
         ui.tip(plain(label), tip)
+        if clearable and has then
+            im.SameLine(0, 4)
+            if im.Button('x##kclr' .. id, V2(24, 0)) then set(0) end
+        end
     end
 
     -- kombinacja klawiszy (np. Ctrl+Shift+End); klik -> nacisnij kombinacje, Esc = anuluj
@@ -14811,19 +14726,85 @@ A.register({
     end,
 })
 
+-- Ustawienia: wszystkie moduly w jednym miejscu (z ich stanem), klawisze, HUD, diagnostyka zaleznosci
+local MODULE_ROWS = {
+    { 'tracker', 'Tracker', 'Sledzenie gracza, lista graczy, najblizszy teleport.' },
+    { 'graffiti', 'Gang: graffiti', 'Graffiti na radarze, HUD przejec, auto /graffiti, Strefy Bot.' },
+    { 'strefy', 'Gang: strefy', 'Stan stref, HUD atakow, alerty Discord. Wymagany przez Strefy Bota.' },
+    { 'pool', 'Bilard', 'Tor bili, planer zagrania, kalibracja sily. Zmiana dziala w pelni po restarcie skryptu.' },
+    { 'gpt', 'SAMPGPT', 'Asystent AI (Gemini): /ai, quizy, rebusy, OX, mapa.' },
+    { 'karta', 'Karty Bot', 'Kasyno: automatyczna gra w karty.' },
+    { 'gornik', 'Gornik Bot', 'Kopalnia: klawisze przy wydobyciu, pelny automat, znaczniki rud.' },
+    { 'autoy', 'Makro', 'Szybkie wciskanie klawisza (domyslnie Y).' },
+    { 'statuetki', 'Statuetki', 'Znalezione statuetki na radarze (zakladka Tracker).' },
+    { 'walizki', 'Walizki', 'Walizki w zasiegu na radarze (zakladka Tracker).' },
+}
+
+local function moduleRow(row)
+    local ui = A.ui
+    local id = row[1]
+    local m = A.mods[id]
+    if not m then return end
+    moduleSwitch(id, row[2], row[3])
+    local st, col
+    if A.cfg.modules[id] == false then
+        st, col = 'wylaczony', 0xFF8A8A96
+    elseif m.initErr then
+        st, col = 'blad startu', 0xFFFF6666
+    elseif not m.ready then
+        st = '...'
+    elseif m.status then
+        local ok, r = pcall(m.status)
+        st = ok and A.u8(tostring(r)) or '?'
+    end
+    if st then ui.right(#st > 34 and (st:sub(1, 33) .. '~') or st, col) end
+end
+
+local function depRow(name, ok, err)
+    local ui = A.ui
+    ui.kv(name, ok and 'OK' or 'brak', ok and 0xFF33FF66 or 0xFFFF6666)
+    if not ok and err then
+        ui.tip(name, tostring(err):sub(1, 300))
+    end
+end
+
 A.register({
     id = 'settings', title = 'Ustawienia', ready = true,
     menu = function()
         local ui = A.ui
-        ui.group('Klawisze', function()
-            ui.combo('Menu', A.cfg.menuKey, A.cfg.menuMods, function(k, m)
-                A.cfg.menuKey, A.cfg.menuMods = k, m
-                A.saveCore()
-            end, false, 'Klawisz otwierajacy to menu. Mozesz ustawic kombinacje, np. Ctrl+Insert.')
-            ui.combo('Panic key', A.cfg.panicKey, A.cfg.panicMods, function(k, m)
-                A.cfg.panicKey, A.cfg.panicMods = k, m
-                A.saveCore()
-            end, true, 'Natychmiast wylacza caly skrypt, bez zadnych komunikatow. Ustaw kombinacje, ktorej nie wcisniesz przypadkiem.')
+        ui.cols(function()
+            ui.group('Klawisze', function()
+                ui.combo('Menu', A.cfg.menuKey, A.cfg.menuMods, function(k, m)
+                    if k == 0 then return end
+                    A.cfg.menuKey, A.cfg.menuMods = k, m
+                    A.saveCore()
+                end, false, 'Klawisz otwierajacy to menu. Mozesz ustawic kombinacje, np. Ctrl+Insert.')
+                ui.combo('Panic key', A.cfg.panicKey, A.cfg.panicMods, function(k, m)
+                    A.cfg.panicKey, A.cfg.panicMods = k, m
+                    A.saveCore()
+                end, true, 'Natychmiast wylacza caly skrypt, bez zadnych komunikatow. Ustaw kombinacje, ktorej nie wcisniesz przypadkiem.')
+            end)
+            ui.group('HUD', function()
+                ui.wrap('Gdy menu jest otwarte, kazdy HUD ma ramke - przeciagnij go mysza w inne miejsce.', 0xFF8A8A96)
+                if ui.button('Przywroc domyslne pozycje##hud', nil, 'Wszystkie HUD-y wracaja na swoje miejsca startowe.') then
+                    A.hudReset()
+                end
+            end)
+            ui.group('Informacje', function()
+                ui.kv('Wersja', 'antek.cc ' .. A.VERSION)
+                depRow('SF.lua', A.sf, A.sfErr)
+                depRow('SAMP-API', A.sampapi ~= nil, A.sampapiErr)
+                depRow('mimgui', A.imgui ~= nil, A.imguiErr)
+                ui.kv('samp.events', A.sev and 'OK' or (A.cfg.modules.pool == false and 'nieuzywane' or 'brak'),
+                    A.sev and 0xFF33FF66 or 0xFF8A8A96)
+                if A.restarts > 0 then ui.kv('Wznowione watki', A.restarts, 0xFFFFD24A) end
+                ui.textDim('Logi: moonloader\\moonloader.log')
+            end)
+        end, function()
+            ui.group('Moduly', function()
+                for _, row in ipairs(MODULE_ROWS) do moduleRow(row) end
+                ui.textDim('Wylaczony modul nie dziala w tle i nie rysuje HUD.')
+            end)
         end)
     end,
 })
@@ -14873,8 +14854,16 @@ function main()
         A.say('antek.cc', '{FF6666}Brak mimgui - menu niedostepne (moonloader\\lib\\mimgui).')
         A.log('antek.cc', 'mimgui: ' .. tostring(A.imguiErr))
     end
+    local hints = {}
     for _, m in ipairs(A.order) do
         if m.initErr then A.say('antek.cc', '{FF6666}' .. m.title .. ' nie wystartowal: ' .. m.initErr:sub(1, 80)) end
+        if m.ready and m.setupHint and A.isOn(m.id) then
+            local ok, h = pcall(m.setupHint)
+            if ok and h then hints[#hints + 1] = h end
+        end
+    end
+    if #hints > 0 and A.imgui then
+        A.say('antek.cc', '{FFD24A}Do ustawienia w menu:{FFFFFF} ' .. table.concat(hints, ', ') .. '.')
     end
 
     local nextRes, nextSup = 0, 0
