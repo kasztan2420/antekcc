@@ -1,4 +1,4 @@
-local VERSION = '2.0.0'
+local VERSION = '2.1.0'
 
 script_name('antek.cc')
 script_author('antek')
@@ -2699,6 +2699,10 @@ local gbStop                                                       -- (ponizej) 
 local NF = A.newNav({ tag = 'gangbot', CELL = 0.8, CLEAR = 0.32, SOFT_CLEAR = 0.8, SOFT_COST = 1.4,
     H_LOW = 0.6, H_MID = 0.95, H_HIGH = 1.4, STEP_UP = 0.7, STEP_DOWN = 2.5, DIRECT_MAX = 40, MARGIN = 20,
     MAX_EXP = 4000, WEIGHT = 1.3, BUDGET = 0.0025, STEP_MAX = 40, CACHE_TTL = 300, UNKNOWN_FAR = 60 })
+-- motor: wieksza komorka, szersze przejscia (CLEAR), srodkiem przejsc (SOFT_*), krawezniki max 0.4 m (MID_STEP)
+local NB = A.newNav({ tag = 'gangbot-motor', CELL = 1.5, CLEAR = 0.6, SOFT_CLEAR = 1.6, SOFT_COST = 1.6,
+    H_LOW = 0.5, H_MID = 0.9, H_HIGH = 1.3, STEP_UP = 0.5, STEP_DOWN = 1.5, MID_STEP = 0.4, DIRECT_MAX = 80, MARGIN = 25,
+    MAX_EXP = 2500, WEIGHT = 1.6, BUDGET = 0.002, STEP_MAX = 40, CACHE_TTL = 300, UNKNOWN_FAR = 60 })
 
 local function gbLog(msg) A.log('gangbot', msg) end
 local function wrap180(a) return (a + 540) % 360 - 180 end
@@ -2898,10 +2902,12 @@ local function rnDropArea(a)
     RN.area[a] = nil
 end
 
--- budowa obszaru po kawalku (400 wezlow na klatke - bez przyciec)
+-- budowa obszaru po kawalku: paczki po 150 wezlow, do 2 ms na klatke (bez przyciec, ale bez czekania)
 local function rnBuildChunk(B)
     local a, b, L = B.a, B.b, B.L
-    local last = min(B.V, B.i + 400) - 1
+    local t0 = A.hires()
+    local last = min(B.V, B.i + 150) - 1
+    while true do
     for i = B.i, last do
         local n = b + i * 0x1C
         local x, y, z = ri16(n + 8) / 8, ri16(n + 10) / 8, ri16(n + 12) / 8
@@ -2922,6 +2928,9 @@ local function rnBuildChunk(B)
         end
     end
     B.i = last + 1
+    if B.i >= B.V or A.hires() - t0 > 0.002 then break end
+    last = min(B.V, B.i + 150) - 1
+    end
     if B.i >= B.V then
         RN.area[a] = { b = b, V = B.V, ids = B.ids }
         RN.nodes = RN.nodes + #B.ids
@@ -2931,6 +2940,7 @@ end
 
 -- true = siec drog gotowa, 'busy' = jeszcze sie buduje (sprobuj w nastepnej klatce), false = niedostepna
 local function rnUpdate()
+    if RN.fake then return RN.nodes > 0 end                        -- testy: siec drog podana z zewnatrz
     local now = A.now()
     if RN.off == false then
         if (RN.tries or 0) >= 5 or now < (RN.retryAt or 0) then return false end
@@ -3083,11 +3093,15 @@ local function rnExhausted(job)
     return 'fail'
 end
 
+-- wazone A* (h x 1.4: trasa najwyzej ~40% dluzsza, przeszukanie wielokrotnie mniejsze), do 3 ms na klatke
+local RN_W, RN_BUDGET = 1.4, 0.003
 local function rnRun(job)
     local px, py, adj, pen = RN.px, RN.py, RN.adj, RN.pen
     local gx, gy = px[job.g], py[job.g]
     if not gx then return 'fail' end
-    for _ = 1, 300 do
+    local t0 = A.hires()
+    for n = 1, 4000 do
+        if n % 64 == 0 and A.hires() - t0 > RN_BUDGET then break end
         local id = hpop(job.open)
         if not id then
             local r = rnExhausted(job)
@@ -3106,14 +3120,27 @@ local function rnRun(job)
             local g0, x0, y0 = job.gs[id], px[id], py[id]
             local h0 = sqrt(dist2(x0, y0, gx, gy))
             if h0 < job.bestH then job.best, job.bestH = id, h0 end
+            local fid = job.from[id]                               -- kierunek dojazdu do wezla (kara za skret)
+            local dxp, dyp, lp
+            if fid and px[fid] then
+                dxp, dyp = x0 - px[fid], y0 - py[fid]
+                lp = sqrt(dxp * dxp + dyp * dyp)
+            end
             for _, nb in ipairs(adj[id] or {}) do
                 local nx, ny = px[nb], py[nb]
                 if nx and not job.closed[nb] then
-                    local ng = g0 + sqrt(dist2(nx, ny, x0, y0)) * (pen[nb] and 5 or 1)
+                    local el = sqrt(dist2(nx, ny, x0, y0))
+                    -- skret na skrzyzowaniu kosztuje (90 deg ~ 17 m prostej): trasa bez "schodkow" po kazdej przecznicy
+                    local turn = 0
+                    if lp and lp > 0.5 and el > 0.5 then
+                        local c = (dxp * (nx - x0) + dyp * (ny - y0)) / (lp * el)
+                        if c < 0.7 then turn = (0.7 - c) * 25 end
+                    end
+                    local ng = g0 + el * (pen[nb] and 5 or 1) + turn
                     local og = job.gs[nb]
                     if not og or ng < og then
                         job.gs[nb], job.from[nb] = ng, id
-                        hpush(job.open, ng + sqrt(dist2(nx, ny, gx, gy)), nb)
+                        hpush(job.open, ng + RN_W * sqrt(dist2(nx, ny, gx, gy)), nb)
                     end
                 end
             end
@@ -3193,7 +3220,7 @@ end
 -- punkt na trasie L metrow za rzutem pozycji na biezacy odcinek
 local function pathLook(path, wi, x, y, L)
     local a, b = path[wi], path[wi + 1]
-    if not b then return a.x, a.y end
+    if not b then return a.x, a.y, wi end
     local dx, dy = b.x - a.x, b.y - a.y
     local l2 = dx * dx + dy * dy
     local t = l2 > 1e-6 and max(0, min(1, ((x - a.x) * dx + (y - a.y) * dy) / l2)) or 1
@@ -3201,11 +3228,11 @@ local function pathLook(path, wi, x, y, L)
     local rem, i = L, wi
     while true do
         local nb = path[i + 1]
-        if not nb then return path[i].x, path[i].y end
+        if not nb then return path[i].x, path[i].y, i end
         local sl = sqrt(dist2(nb.x, nb.y, sx, sy))
         if sl >= rem then
             local k = rem / max(sl, 1e-3)
-            return sx + (nb.x - sx) * k, sy + (nb.y - sy) * k
+            return sx + (nb.x - sx) * k, sy + (nb.y - sy) * k, i
         end
         rem = rem - sl
         sx, sy, i = nb.x, nb.y, i + 1
@@ -3418,9 +3445,123 @@ local function feeler(cx, cy, cz, h, ang, len)
     return best
 end
 
+-- Wachlarz promieni przed pojazdem (lokalny planer): kat od kierunku jazdy [deg, + = w lewo], gesciej na wprost.
+-- Liczony po kawalku: 3 przednie promienie co klatke + FAN_STEP kolejnych (caly wachlarz co ~6 klatek).
+local FAN = { 0, 4, -4, 8, -8, 12, -12, 16, -16, 22, -22, 30, -30, 40, -40, 52, -52, 66, -66, 80, -80 }
+local FAN_FRONT, FAN_STEP = 3, 3
+local HARD_DEC = 7.0                                               -- [m/s^2] hamowanie przed przeszkoda
+local NEAR_R = 70                                                  -- [m] blizej celu: trasa po kolizji (NB)
+local NAV_MAX = 180                                                -- [m] bez sieci drog: NB najwyzej z takiej odleglosci
+
+local function fanLen(spd) return A.clamp(10 + spd * 1.3, 12, 45) end
+
+local function fanRay(F, i, cx, cy, cz, h, L)
+    local a = FAN[i]
+    local len = L * (1 - math.abs(a) / 150)
+    local d = feeler(cx, cy, cz, h, a, len)
+    F.d[i], F.hit[i] = d or len, d ~= nil
+end
+
+local function fanScan(D, cx, cy, cz, h, spd)
+    local F = D.fan
+    local L = fanLen(spd)
+    if not F.full then
+        for i = 1, #FAN do fanRay(F, i, cx, cy, cz, h, L) end
+    else
+        for i = 1, FAN_FRONT do fanRay(F, i, cx, cy, cz, h, L) end
+        local rest = #FAN - FAN_FRONT
+        for _ = 1, FAN_STEP do
+            F.i = F.i % rest + 1
+            fanRay(F, FAN_FRONT + F.i, cx, cy, cz, h, L)
+        end
+    end
+    F.full, F.L = true, L
+end
+
+-- wolna droga w kierunku a: najblizsze trafienie, ktore lezy w pasie jazdy (bocznie blizej niz FAN_W od osi a);
+-- geometrycznie, wiec brama 5 m z 15 m jest przejezdna, a sciana z boku waskiej uliczki nie blokuje jazdy prosto
+local FAN_W = 1.2                                                  -- [m] pol szerokosci motoru + zapas
+local function fanClear(F, a)
+    local c = F.L
+    for i, fa in ipairs(FAN) do
+        if F.hit[i] then
+            local da = math.rad(math.abs(fa - a))
+            if da < math.pi / 2 and F.d[i] * math.sin(da) < FAN_W then
+                local along = F.d[i] * math.cos(da)
+                if along < c then c = along end
+            end
+        end
+    end
+    return c, c < F.L
+end
+
+-- kierunek jazdy: chciany (want), jesli wolny na droge hamowania; inaczej najblizszy wolny z wachlarza.
+-- Raz wybrana strona omijania obowiazuje 1.5 s (bez przeskakiwania lewo-prawo przed przeszkoda).
+-- Zwraca: kierunek, wolna droga w nim, czy cos w nim jest, wolna droga w kierunku chcianym (nil = wolny)
+local function fanPick(D, want, spd, dfin, now)
+    local F = D.fan
+    -- droga hamowania + zapas; blisko celu wystarczy dojechac do celu (checkpoint tuz przy scianie)
+    local need = math.min(F.L * 0.85, spd * spd / (2 * HARD_DEC) + 4, dfin + 1.0)
+    local cw, hw = fanClear(F, A.clamp(want, -80, 80))
+    if not hw or cw >= need then return want, cw, hw, nil end
+    local side = (now < (D.sideUntil or 0)) and D.side or 0
+    local best, bc, bcl, bh
+    for _, a in ipairs(FAN) do
+        local c, hit = fanClear(F, a)
+        local cost = math.abs(wrap180(a - want)) + 0.35 * math.abs(a - (D.lastA or 0))
+        if hit and c < need then cost = cost + 1000 - c * 10 end
+        if side ~= 0 and (a - want) * side < 0 then cost = cost + 60 end
+        if not bc or cost < bc then best, bc, bcl, bh = a, cost, c, hit end
+    end
+    if best ~= want then D.side, D.sideUntil = (best > want) and 1 or -1, now + 1.5 end
+    return best, bcl, bh, cw
+end
+
+-- najwieksze odejscie trasy od prostej pojazd -> punkt docelowy (o ile scielibysmy zakret)
+local function chordDev(path, wi, li, x, y, lx, ly)
+    local dx, dy = lx - x, ly - y
+    local l = sqrt(dx * dx + dy * dy)
+    if l < 0.5 then return 0 end
+    local m = 0
+    for i = wi + 1, li do
+        local p = path[i]
+        local d = math.abs((p.x - x) * dy - (p.y - y) * dx) / l
+        if d > m then m = d end
+    end
+    return m
+end
+
+-- pure pursuit bez scinania zakretow: punkt docelowy blizej, gdy prosta do niego odbiega od trasy o > 1 m.
+-- Skracanie od razu (bezpieczenstwo), wydluzanie plynnie (bez skokow kierownicy za zakretem).
+local function lookSafe(D, path, x, y, L, dt)
+    local wi = D.wi
+    if D.Lf and L > D.Lf then L = math.min(L, D.Lf + 6 * dt) end
+    local lx, ly, li = pathLook(path, wi, x, y, L)
+    for _ = 1, 8 do
+        if L <= 4 or chordDev(path, wi, li, x, y, lx, ly) <= 1.0 then break end
+        L = math.max(4, L * 0.85)
+        lx, ly, li = pathLook(path, wi, x, y, L)
+    end
+    D.Lf = L
+    return lx, ly
+end
+
+-- trasa z siatki A* (kroki co 1.5 m, katy 45 deg) -> lagodna linia (Chaikin; 2x = luki zamiast schodkow), konce bez zmian
+local function smoothPts(pts)
+    if #pts < 3 then return pts end
+    local out = { pts[1] }
+    for i = 1, #pts - 1 do
+        local a, b = pts[i], pts[i + 1]
+        if i > 1 then out[#out + 1] = { x = a.x * 0.75 + b.x * 0.25, y = a.y * 0.75 + b.y * 0.25, z = a.z * 0.75 + b.z * 0.25 } end
+        if i < #pts - 1 then out[#out + 1] = { x = a.x * 0.25 + b.x * 0.75, y = a.y * 0.25 + b.y * 0.75, z = a.z * 0.25 + b.z * 0.75 } end
+    end
+    out[#out + 1] = pts[#pts]
+    return out
+end
+
 local function driveStart(now)
-    MV.drv = { stucks = 0, stalls = 0, wAt = 0, wLen = 6, path = nil, job = nil, wi = 1, replans = 0,
-        steer = 0, thr = 0, brk = 0, avoid = 0, lastT = now, vmax = cfg.botSpeed * (0.92 + math.random() * 0.08) }
+    MV.drv = { stucks = 0, stalls = 0, wi = 1, replans = 0, steer = 0, thr = 0, brk = 0, lastT = now,
+        fan = { d = {}, hit = {}, i = 0, L = 12 }, vmax = cfg.botSpeed * (0.92 + math.random() * 0.08) }
 end
 
 -- gaz / hamulec analogowo, plynnie (bez przelaczania pelny gaz <-> pelny hamulec co klatke)
@@ -3441,7 +3582,7 @@ local function pedals(D, vt, spd, dt)
     if D.thr > 160 and spd < 9 then pad(1, -45) end              -- lekko do przodu: bez wheelie przy ruszaniu
 end
 
--- kierownica: cel z pure pursuit, ograniczona predkosc obrotu i mniejszy skret przy duzej predkosci
+-- kierownica: ograniczona predkosc obrotu i mniejszy skret przy duzej predkosci
 local function steerTo(D, want, spd, dt)
     local maxS = spd < 8 and 128 or max(55, 128 - (spd - 8) * 3)
     want = A.clamp(want, -maxS, maxS)
@@ -3449,7 +3590,85 @@ local function steerTo(D, want, spd, dt)
     pad(0, floor(D.steer + 0.5))
 end
 
--- jazda do MV.vt = { x, y, z, r }: trasa po drogach (jesli daleko) + pure pursuit + plan predkosci + czujniki przeszkod
+local function setPath(D, pts, src, now)
+    D.path, D.wi, D.src, D.lp, D.Lf = pts, 1, src, nil, nil
+    D.bestLeft, D.bestAt = nil, now
+end
+
+-- od nowa: trasa po drogach i po kolizji (po zablokowaniu / braku postepu)
+local function replan(D)
+    D.path, D.road, D.job, D.nav, D.navDone = nil, nil, nil, nil, false
+end
+
+-- Planowanie w tle, bez zatrzymywania: zanim gotowa jest trasa, pojazd jedzie prosto do celu (wachlarz omija
+-- przeszkody). Daleko: trasa po drogach z pamieci gry. Ostatnie NEAR_R m (albo bez sieci drog): A* po kolizji
+-- dla motoru - liczone, gdy pojazd jeszcze jedzie po drodze, i podmieniane, gdy gotowe.
+local function drivePlan(D, tgt, cx, cy, cz, dfin, now)
+    if not D.path then setPath(D, routePoints(nil, cx, cy, cz, tgt.x, tgt.y, tgt.z), 'prov', now) end
+    local P = ZB.pre
+    if D.road == nil and P and P.route and MV.dest and MV.dest.key == ('z' .. P.id) and dist2(P.sx, P.sy, cx, cy) < 30 * 30 then
+        ZB.pre = nil
+        setPath(D, routePoints(P.route, cx, cy, cz, tgt.x, tgt.y, tgt.z), 'road', now)
+        D.road, D.partial, D.planAt = 'done', false, now
+        gbLog('jazda: trasa policzona juz w czasie przejmowania poprzedniej strefy')
+    end
+    if D.road == nil or D.road == 'wait' then
+        if dfin > NEAR_R then
+            local ok = rnUpdate()
+            if ok == 'busy' then
+                D.road = 'wait'
+            else
+                D.job = ok and rnPlan(cx, cy, cz, tgt.x, tgt.y, tgt.z) or nil
+                D.road = D.job and 'run' or 'none'
+            end
+        else
+            D.road = 'none'
+        end
+    end
+    if D.road == 'run' then
+        local r = rnRun(D.job)
+        if r ~= 'run' then
+            local job = D.job
+            D.job = nil
+            gbLog(('jazda: trasa po drogach %d pkt%s (%d wezlow)'):format(type(r) == 'table' and #r or 0,
+                job.partial and ', czesciowa' or '', job.exp))
+            if type(r) == 'table' and #r > 0 and D.src ~= 'nav' then
+                setPath(D, routePoints(r, cx, cy, cz, tgt.x, tgt.y, tgt.z), 'road', now)
+                D.partial, D.planAt, D.road = job.partial, now, 'done'
+            else
+                D.road = 'none'
+            end
+        end
+    end
+    if not D.nav and not D.navDone and (dfin < NEAR_R or (D.road == 'none' and dfin <= NAV_MAX)) then
+        D.nav = NB.start(cx, cy, cz, tgt.x, tgt.y, tgt.z, 2.0, false, now)
+    end
+    if D.nav then
+        local r = NB.run(D.nav, now)
+        if r ~= 'run' then
+            local nav = D.nav
+            D.nav, D.navDone = nil, true
+            if r == 'fail' then
+                gbLog(('jazda: brak trasy po kolizji (%d wezlow) - zostaje %s'):format(nav.exp, D.src))
+            else
+                -- trasa liczona od miejsca startu obliczen, a pojazd w tym czasie jechal: bez punktow za nim
+                local k, kd = 1, nil
+                for i, q in ipairs(r) do
+                    local dd = dist2(q.x, q.y, cx, cy)
+                    if not kd or dd < kd then k, kd = i, dd end
+                end
+                local pts = { { x = cx, y = cy, z = cz } }
+                for i = k + 1, #r do pts[#pts + 1] = r[i] end
+                pts[#pts + 1] = { x = tgt.x, y = tgt.y, z = tgt.z, final = true }
+                setPath(D, smoothPts(smoothPts(pts)), 'nav', now)
+                if D.road == 'run' then D.job, D.road = nil, 'done' end
+                gbLog(('jazda: trasa po kolizji %d pkt%s, %d wezlow'):format(#pts, nav.direct and ' (prosto)' or '', nav.exp))
+            end
+        end
+    end
+end
+
+-- jazda do MV.vt = { x, y, z, r }: trasa (drogi / kolizja / prosto) + pure pursuit + plan predkosci + wachlarz
 local function driveStep(now, car)
     local D, tgt = MV.drv, MV.vt
     local dt = A.clamp(now - D.lastT, 0.001, 0.1)
@@ -3475,31 +3694,7 @@ local function driveStep(now, car)
         D.nearAt = D.nearAt or now
         if now - D.nearAt > 8 then return 'fail' end
     end
-    if not D.path then
-        if D.job == nil then
-            if dfin > 40 then
-                local ok = rnUpdate()
-                if ok == 'busy' then pedals(D, 0, spd, dt); GB.why = 'mapa drog'; return 'run' end
-                D.job = ok and rnPlan(cx, cy, cz, tgt.x, tgt.y, tgt.z) or false
-            else
-                D.job = false
-            end
-        end
-        local r = nil
-        if D.job then
-            pedals(D, min(spd, 6), spd, dt)                        -- liczenie trasy trwa 1-3 klatki: bez gwaltownego hamowania
-            r = rnRun(D.job)
-            if r == 'run' then GB.why = 'trasa'; return 'run' end
-            D.partial = D.job.partial
-            gbLog(('jazda: trasa po drogach %d pkt%s (%d wezlow)'):format(type(r) == 'table' and #r or 0,
-                D.partial and ', czesciowa' or '', D.job.exp))
-        else
-            D.partial = false
-        end
-        D.job, D.planAt = nil, now
-        D.path, D.wi, D.lp = routePoints(r, cx, cy, cz, tgt.x, tgt.y, tgt.z), 1, nil
-        D.bestLeft, D.bestAt = nil, now
-    end
+    drivePlan(D, tgt, cx, cy, cz, dfin, now)
     if D.rev then                                                  -- cofanie po zablokowaniu (plynnie)
         if now < D.rev.untilT then
             steerTo(D, D.rev.steer, 0, dt)
@@ -3513,9 +3708,10 @@ local function driveStep(now, car)
     local path = D.path
     D.wi = pathAdvance(path, D.wi, cx, cy)
     -- trasa czesciowa (cel w niewczytanym obszarze): nowa trasa, gdy zostalo malo drogi po wezlach
-    if D.partial and D.replans < 8 and dfin > 60 and now - (D.planAt or 0) > 5 and #path >= 3
+    if D.partial and D.src == 'road' and D.replans < 8 and dfin > NEAR_R and now - (D.planAt or 0) > 5 and #path >= 3
         and dist2(path[#path - 1].x, path[#path - 1].y, cx, cy) < 40 * 40 then
-        D.replans, D.path, D.job = D.replans + 1, nil, nil
+        D.replans, D.partial = D.replans + 1, false
+        D.road = nil
         return 'run'
     end
     local left = pathLeft(path, D.wi, cx, cy)
@@ -3527,30 +3723,25 @@ local function driveStep(now, car)
         gbLog(('jazda: brak postepu od 20 s (%d) - nowa trasa'):format(D.stalls))
         if D.stalls >= 3 then return 'fail' end
         if RN.nodes > 0 then rnPenalize(cx, cy) end
-        D.path, D.job = nil, nil
+        replan(D)
         return 'run'
     end
-    local L = A.clamp(4 + spd * 0.6, 5, 20)
-    local lx, ly = pathLook(path, D.wi, cx, cy, L)
-    local err = wrap180(hdg(cx, cy, lx, ly) - h)
-    if now >= D.wAt then
-        D.wAt = now + 0.1
-        D.wLen = 6 + spd * 0.7
-        D.wC = feeler(cx, cy, cz, h, 0, D.wLen)
-        D.wL = feeler(cx, cy, cz, h, 22, D.wLen * 0.75)
-        D.wR = feeler(cx, cy, cz, h, -22, D.wLen * 0.75)
-    end
-    local avoid = 0                                                -- odpychanie od scian (wygladzone)
-    if D.wL then avoid = avoid + 80 * (1 - D.wL / (D.wLen * 0.75)) end
-    if D.wR then avoid = avoid - 80 * (1 - D.wR / (D.wLen * 0.75)) end
-    if D.wC and not D.wL and not D.wR then avoid = avoid + (err > 0 and -55 or 55) * (1 - D.wC / D.wLen) end
-    D.avoid = D.avoid + (avoid - D.avoid) * min(1, dt * 8)
-    local k = spd < 6 and 3.4 or (spd < 15 and 2.5 or 1.7)
-    steerTo(D, -err * k + D.avoid, spd, dt)
+    local lx, ly = lookSafe(D, path, cx, cy, A.clamp(4 + spd * 0.6, 5, 20), dt)
+    local want = wrap180(hdg(cx, cy, lx, ly) - h)
+    fanScan(D, cx, cy, cz, h, spd)
+    local a, clear, hit, cwBlocked = fanPick(D, want, spd, dfin, now)
+    D.lastA = a
+    -- wzmocnienie ciagle (bez progow): przy ~15 m/s schodki 2.5 / 1.7 przeskakiwaly co klatke = szarpanie
+    local k = 3.4 - A.clamp((spd - 4) / 11, 0, 1) * 0.9 - A.clamp((spd - 15) / 10, 0, 1) * 0.8
+    steerTo(D, -a * k, spd, dt)
     local vt = speedPlan(path, D.wi, cx, cy, D.vmax, tgt.r)
-    local ae = math.abs(err)
-    if ae > 35 then vt = min(vt, max(5, 14 - (ae - 35) * 0.15)) end    -- duzy blad kierunku: wolniej, az sie ustawi
-    if D.wC then vt = min(vt, max(3, D.wC * 0.65)) end
+    local ae = math.abs(a)
+    if ae > 35 then vt = min(vt, max(5, 14 - (ae - 35) * 0.15)) end    -- duzy skret: wolniej, az sie ustawi
+    if hit and clear < dfin + 2 then vt = min(vt, max(2.5, sqrt(2 * HARD_DEC * max(0, clear - 3)))) end
+    -- przeszkoda na trasie (nawet gdy omijamy): tyle, zeby zdazyc wyhamowac albo spokojnie zjechac
+    if cwBlocked and cwBlocked < dfin + 2 then vt = min(vt, max(4, 1.25 * sqrt(2 * HARD_DEC * max(0, cwBlocked - 2)))) end
+    if ae > 10 then vt = min(vt, max(6, D.vmax * (1 - ae / 100))) end
+    if D.src == 'prov' and (D.nav or D.road == 'run' or D.road == 'wait') then vt = min(vt, 14) end   -- trasa sie liczy
     pedals(D, vt, spd, dt)
     GB.why = ('jade %.0f m'):format(left)
     if not D.lp then
@@ -3562,11 +3753,13 @@ local function driveStep(now, car)
             D.stucks = D.stucks + 1
             if dfin < tgt.r + 8 and not tgt.exact then return 'arrived' end
             if D.stucks >= 8 then return 'fail' end
-            D.rev = { untilT = now + 1.2, steer = (err > 0) and 110 or -110 }
+            D.rev = { untilT = now + 1.2, steer = (want > 0) and 110 or -110 }
             D.steer, D.thr = 0, 0
-            if D.stucks % 2 == 0 and RN.nodes > 0 then             -- co drugi raz: omijamy to miejsce nowa trasa
-                rnPenalize(cx, cy)
-                D.path, D.job = nil, nil
+            local hr = math.rad(h)                                 -- miejsce przed pojazdem: omijane przez A*
+            NB.p.blocks[#NB.p.blocks + 1] = { x = cx - math.sin(hr) * 2.5, y = cy + math.cos(hr) * 2.5, r = 1.2, untilT = now + 60 }
+            if D.stucks % 2 == 0 then                              -- co drugi raz: nowa trasa omijajaca to miejsce
+                if RN.nodes > 0 then rnPenalize(cx, cy) end
+                replan(D)
             end
             gbLog(('jazda: zablokowany (%d) - cofam%s'):format(D.stucks, D.path and '' or ' i licze nowa trase'))
         end
@@ -3834,6 +4027,48 @@ local function zoneBack(now, px, py, pz, z, state)
     GB.state = state
 end
 
+-- najblizsza strefa do przejecia (bez exclude); zwraca tez ile stref jest i ile naszych
+local function nextZone(sz, px, py, now, exclude)
+    local best, bd, total, mine = nil, nil, 0, 0
+    for id, z in pairs(sz.zones()) do
+        total = total + 1
+        local st = sz.zone(id)
+        if st and st.mine then mine = mine + 1 end
+        if id ~= exclude and zoneEligible(sz, id, now) and (z.int or 0) == 0 then
+            local d = dist2(z.x, z.y, px, py)
+            if not bd or d < bd then best, bd = z, d end
+        end
+    end
+    return best, bd, total, mine
+end
+
+-- W trakcie 60 s stania na checkpoincie: /strefy odswiezane w tle i trasa po drogach do nastepnej strefy
+-- liczona z gory - po przejeciu bot od razu rusza, bez postoju na "odswiezam" i "trasa".
+local function zPrefetch(now, px, py, pz, sz, cur)
+    if now - ZB.t0 < 3 then return end
+    if os.time() - sz.snap.at > 150 and now - (ZB.refreshAt or -1e9) > 120 and not sz.browsing() then
+        ZB.refreshAt = now
+        sz.refresh()
+        return
+    end
+    local P = ZB.pre
+    if P and P.from ~= cur.id then P, ZB.pre = nil, nil end
+    if not P then
+        local nz = nextZone(sz, px, py, now, cur.id)
+        if not nz or dist2(nz.x, nz.y, px, py) < NEAR_R * NEAR_R or rnUpdate() ~= true then return end
+        local job = rnPlan(px, py, pz, nz.x, nz.y, nz.z)
+        if job then ZB.pre = { from = cur.id, id = nz.id, job = job, sx = px, sy = py } end
+        return
+    end
+    if P.job then
+        local r = rnRun(P.job)
+        if r ~= 'run' then
+            P.job, P.route = nil, (type(r) == 'table' and #r > 0) and r or false
+            gbLog(('strefa %s: trasa do nastepnej (%d) gotowa z gory, %d pkt'):format(cur.name, P.id, P.route and #P.route or 0))
+        end
+    end
+end
+
 local function zjPick(now, px, py, pz)
     releaseAll()
     mvHold()
@@ -3846,17 +4081,7 @@ local function zjPick(now, px, py, pz)
         return
     end
     if now < (ZB.waitUntil or 0) then return end
-    local list = sz.zones()
-    local best, bd, total, mine = nil, nil, 0, 0
-    for id, z in pairs(list) do
-        total = total + 1
-        local st = sz.zone(id)
-        if st and st.mine then mine = mine + 1 end
-        if zoneEligible(sz, id, now) and (z.int or 0) == 0 then
-            local d = dist2(z.x, z.y, px, py)
-            if not bd or d < bd then best, bd = z, d end
-        end
-    end
+    local best, bd, total, mine = nextZone(sz, px, py, now)
     ZB.total, ZB.mine = total, mine
     if total > 0 and mine == total then return gbStop(('Strefy Bot: wszystkie strefy sa nasze (%d).'):format(total)) end
     if not best then
@@ -3941,7 +4166,7 @@ local function zjStep(now, px, py, pz)
             end
         end
         if ZB.pressAt and now - ZB.pressAt < 3 then GB.why = ('strefa %s: Y'):format(z.name); return end
-        if not ZB.pressAt and now - ZB.arriveAt < 0.6 then GB.why = 'staje'; return end
+        if not ZB.pressAt and now - ZB.arriveAt < 0.35 then GB.why = 'staje'; return end
         -- serwer nie napisal "Wcisnij Y" (checkpoint jeszcze nie pod nami): podjedz dokladniej, max 2 razy
         if not ZB.pressAt and d2 > 1.0 and (ZB.nudge or 0) < 2 and not zEvent(ZB.arriveAt - 4, { prompt = true }) then
             ZB.nudge = (ZB.nudge or 0) + 1
@@ -4001,6 +4226,7 @@ local function zjStep(now, px, py, pz)
             return zoneBack(now, px, py, pz, z, 'zback')
         end
         mvHold()
+        pcall(zPrefetch, now, px, py, pz, sz, z)
         GB.why = ('strefa %s: przejecie %d s'):format(z.name, math.max(0, math.ceil(ZONE_TIME - el)))
     end
 end
@@ -4010,7 +4236,7 @@ gbStop = function(msg)
     releaseAll()
     GB.on, GB.state = false, 'off'
     MV.state, MV.dest, MV.ft, MV.drv = nil, nil, nil, nil
-    A.zoneBotBusy, A.zoneBotOn = false, false
+    A.zoneBotBusy, A.zoneBotOn, ZB.pre = false, false, nil
     if msg then A.say('Gang', msg, '7FD07F') end
 end
 
@@ -4023,7 +4249,7 @@ local function gbStart()
     GB.on, GB.state, GB.why = true, 'pick', ''
     MV.noBike, MV.state, MV.ft, MV.drv = {}, nil, nil, nil
     MV.nrgNext = 0
-    ZB.skip, ZB.refreshed, ZB.waitUntil = {}, false, 0
+    ZB.skip, ZB.refreshed, ZB.waitUntil, ZB.pre = {}, false, 0, nil
     GB.bike = myCar()
     pcall(rnUpdate)
     gbLog('Strefy Bot start, ' .. MODE_NAME[cfg.botMode] .. (RN.off and ', trasy po drogach' or ''))
@@ -4039,6 +4265,10 @@ local function gbStep(now)
     end
     A.zoneBotOn, A.zoneBotBusy = GB.on, GB.on                     -- auto /graffiti czeka, az bot skonczy
     if not GB.on then return end
+    if now >= (RN.tickAt or 0) then                                -- siec drog budowana w tle: gotowa, zanim bedzie potrzebna
+        RN.tickAt = now + ((RN.build or RN.off == nil) and 0 or 1.0)
+        pcall(rnUpdate)
+    end
     if A.menuOpen or A.pauseActive() or A.chatInputActive() or A.dialogActive() or not A.gameFocused() then
         releaseAll()
         GB.why = 'pauza'
@@ -4145,6 +4375,9 @@ return {
     end,
     stop = function() if GB.on then gbStop() end end,
     release = releaseAll,
+    -- haki dla tests/sim_drive.lua (symulator jazdy bez gry)
+    test = { MV = MV, GB = GB, ZB = ZB, RN = RN, NB = NB, NF = NF, mvDrive = mvDrive, rnPlan = rnPlan, rnRun = rnRun,
+        driveStep = function(...) return driveStep(...) end },
 }
 end)()
 
@@ -4162,6 +4395,7 @@ function M.init()
 end
 
 function M.onKey(vk) GBX.key(vk) end
+M.botTest = GBX.test
 
 function M.frame(now)
     runAuto()

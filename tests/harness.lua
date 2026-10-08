@@ -12,7 +12,8 @@ os.execute('mkdir -p "' .. H.workdir .. '/config"')
 
 local STUB = setmetatable({}, { __call = function() return nil end })
 
-local env = {
+local env
+env = {
     getWorkingDirectory = function() return H.workdir end,
     addEventHandler = function(name, fn) H.events = H.events or {}; H.events[name] = H.events[name] or {}; table.insert(H.events[name], fn) end,
     lua_thread = { create = function(fn) return { status = function() return 'suspended' end, run = function() end, fn = fn } end },
@@ -22,6 +23,8 @@ local env = {
     createDirectory = function(p) os.execute('mkdir -p "' .. p:gsub('\\', '/') .. '"'); return true end,
     doesFileExist = function(p) local f = io.open(p:gsub('\\', '/'), 'rb'); if f then f:close(); return true end; return false end,
 }
+
+H.env = env
 
 -- sciezki Windows (\\) -> POSIX, zeby zapis/odczyt plikow dzialal w testach
 local rawOpen, rawRemove, rawRename = io.open, os.remove, os.rename

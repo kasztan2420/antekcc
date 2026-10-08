@@ -12,13 +12,13 @@ Jeden plik, `antek.lua`, w 100% ASCII — kodowanie pliku nie ma znaczenia dla M
 | | Walizki | Walizki (model 19624) w zasięgu na radarze; podniesiona znika |
 | Gang | Graffiti | Graffiti na radarze w kolorze gangu, HUD przejęć, auto `/graffiti` w tle |
 | | Strefy | Stan stref (`/strefy` + czat), HUD ataku i HUD wroga, alerty Discord |
-| | Strefy Bot | Dojazd na checkpoint strefy (NRG-500 albo pieszo), `Y`, przejęcie, następna |
+| | Strefy Bot | Dojazd na checkpoint strefy (NRG-500 albo pieszo), `Y`, przejęcie, następna — szczegóły niżej |
 | Boty | Karty Bot | Kasyno: automatyczna gra w karty |
 | | Górnik Bot | Klawisze przy wydobyciu, pełny automat (bieg do rud, sprzedaż), znaczniki rud |
 | | Makro | Szybkie wciskanie klawisza (domyślnie `Y`) |
 | Bilard | Bilard | Tor bili, odbicia, łuzy, zalecana siła, planer zagrania, kalibracja |
 | SAMPGPT | SAMPGPT | Asystent AI (Gemini): `/ai`, quizy i rebusy z czatu/ekranu, OX, mapa z pamięci gry |
-| Ustawienia | — | Klawisz menu, panic key, włączanie modułów, reset HUD-ów, stan zależności |
+| Ustawienia | — | Klawisz menu, panic key |
 
 ## Wymagania
 
@@ -32,13 +32,9 @@ Jeden plik, `antek.lua`, w 100% ASCII — kodowanie pliku nie ma znaczenia dla M
 
 1. Skopiuj `antek.lua` do folderu `moonloader`.
 2. Uruchom grę, wejdź na serwer, naciśnij **Insert**.
-3. Przy pierwszym starcie skrypt napisze na czacie, co jest do ustawienia:
-   - **Gang → Opcje → Mój gang** — tag gangu (np. `CWL`), po nim skrypt odróżnia nasze graffiti,
-   - **Gang → Strefy → Nazwa gangu** — pełna nazwa gangu (alerty, nasze strefy, Strefy Bot),
-   - **Gang → Strefy → Webhook** — opcjonalnie, alerty o strefach na Discorda (przycisk *Wyślij test*),
-   - **SAMPGPT → Klucz API** — opcjonalnie, darmowy klucz z [aistudio.google.com](https://aistudio.google.com).
 
-Nie używasz któregoś modułu? Wyłącz go w **Ustawienia → Moduły** — wyłączony nie działa w tle i nie rysuje HUD.
+Gang (*Imperium orczych bagniakow CWL*, tag `CWL`), webhook Discorda i klucz Gemini API są wpisane na stałe
+w `antek.lua` — nic nie trzeba ustawiać.
 
 Stare ustawienia (`TagBlips.json`, `pooltracer.lua`, `PlayerTracker_*.txt`) są importowane automatycznie przy pierwszym starcie.
 
@@ -71,8 +67,20 @@ HUD-y przeciągasz myszą, gdy menu jest otwarte.
 | `moonloader/pickupy_dump.txt`, `walizki_dump.txt` | znalezione statuetki / walizki |
 | `moonloader/moonloader.log` | diagnostyka wszystkich modułów |
 
-Klucz API i webhook są tylko w tych plikach na Twoim dysku — nie udostępniaj folderu `config`.
+Webhook Discorda i klucz Gemini są wpisane w `antek.lua` — nie publikuj tego pliku (ani repo) publicznie.
 Uszkodzony plik JSON jest odkładany jako `.bak`, a moduł startuje z ustawieniami domyślnymi.
+
+## Strefy Bot — jak jeździ
+
+- **Trasa:** daleko — po sieci dróg z pamięci gry (A* z karą za skręty, liczone w tle, sieć budowana od startu bota);
+  ostatnie 70 m — A* po kolizji gry dla motoru (szerokie przejścia, krawężniki do 0,4 m), liczone,
+  gdy motor jeszcze jedzie po drodze. W czasie liczenia bot jedzie dalej, nie staje.
+- **Ściany i przeszkody:** wachlarz 21 promieni przed motorem (gęściej na wprost). Bot trzyma się trasy, dopóki droga
+  jest wolna na odległość hamowania; inaczej wybiera najbliższy wolny kierunek i trzyma się raz wybranej strony omijania.
+  Prędkość ograniczana odległością do przeszkody i ostrością skrętu.
+- **Zakręty:** punkt pure pursuit skracany przed zakrętem (bez ścinania narożników budynków), płynnie wydłużany za nim.
+- **Bez postojów:** w trakcie 60 s przejmowania strefy `/strefy` odświeża się w tle, a trasa do następnej strefy
+  liczy się z góry — po przejęciu bot od razu rusza.
 
 ## Rozwój
 
@@ -80,10 +88,13 @@ Uszkodzony plik JSON jest odkładany jako `.bak`, a moduł startuje z ustawienia
 luarocks install luacheck
 luacheck antek.lua tests/     # konfiguracja: .luacheckrc
 luajit tests/run.lua          # testy bez gry: atrapy API MoonLoadera i mimgui
+luajit tests/sim_drive.lua    # Strefy Bot w symulatorze jazdy (budynki, motor, raycasty z kosztem jak w grze)
+luajit tests/sim_drive.lua zaulek trace   # jeden scenariusz z przebiegiem co 0,5 s
 ```
 
 `tests/run.lua` ładuje cały skrypt pod czystym LuaJIT i sprawdza m.in. JSON, kodowanie CP1250 ↔ UTF-8,
 parsery stref, zapis konfiguracji, `init()` / `frame()` wszystkich modułów oraz render i kliknięcia
-każdej zakładki menu.
+każdej zakładki menu. `tests/sim_drive.lua` puszcza bota w 16 scenariuszach (ściana na wprost, brama, wąska
+szczelina, zaułek, auto na jezdni, las słupów, miasto z drogami i bez, 30 m/s…) i wymaga dojazdu bez ani jednej kolizji.
 
 Nowy moduł: `A.register{ id, title, init, frame, menu, ... }` — opis kontraktu na początku `antek.lua`.

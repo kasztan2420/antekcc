@@ -1,5 +1,25 @@
 # Zmiany
 
+## 2.1.0
+
+### Strefy Bot — jazda
+- Wachlarz 21 promieni (zamiast 3 czujników) z geometrycznym pasem jazdy: bot omija ściany, auta, słupy,
+  przejeżdża przez bramy i wąskie przejścia, trzyma raz wybraną stronę omijania, zwalnia przed przeszkodą na trasie.
+- Ostatnie 70 m do checkpointu: A* po kolizji gry dla motoru, liczone w tle w trakcie jazdy po drodze
+  (wcześniej: prosto + czujniki, czyli w podwórkach i zaułkach w ścianę).
+- Pure pursuit bez ścinania zakrętów (lookahead skracany przed zakrętem, płynnie wydłużany za nim),
+  ciągłe wzmocnienie kierownicy.
+- Trasa po drogach: ważone A* z budżetem czasu na klatkę i karą za skręty (bez „schodków” po przecznicach);
+  sieć dróg budowana w tle od startu bota; w czasie liczenia bot jedzie dalej zamiast zwalniać do 6 m/s.
+- Trasa do następnej strefy liczona w trakcie przejmowania bieżącej, `/strefy` odświeżane w tle —
+  po przejęciu bot rusza od razu. Krótsza pauza przed `Y`.
+- Symulator jazdy w testach: na tych samych 14 scenariuszach stary bot nie dojechał w 5 i miał łącznie 114 kolizji;
+  nowy dojeżdża we wszystkich 16 (z dwoma nowymi) bez żadnej kolizji.
+
+### Konfiguracja
+- Webhook, klucz Gemini i gang (*Imperium orczych bagniakow CWL*, tag `CWL`) na stałe w skrypcie, bez pól w menu.
+- Ustawienia: tylko klawisze (bez Modułów, HUD, Informacji).
+
 ## 2.0.0
 
 Wydanie publiczne: porządki, poprawki błędów, konfiguracja z menu zamiast z kodu.
