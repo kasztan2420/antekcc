@@ -12100,9 +12100,7 @@ local recent = {}                          -- ostatnie czasy (ms) od komunikatu 
 local lat = 0.11                           -- srednio: wcisniecie -> nowy komunikat (s)
 local lastPress = { id = nil, t = -1e9 }
 local cfgDirty = false
-local oreTd = { id = nil }
-local oreTextInfo                          -- zdefiniowane ponizej
-local nextDisc = 0
+local disc = { at = 0, i = 0 }             -- pelny przeglad textdrawow: nastepny start, kursor
 
 local function save()
     A.saveJson(FILE, { key = C.key, hud = C.hud, autoOff = C.autoOff, learn = C.learn, diag = C.diag,
@@ -12236,9 +12234,21 @@ local function fold(s)
     return (s:gsub('^ ', ''):gsub(' $', ''))
 end
 
--- "aby kopac, nacisnij lalt aby przerwac, wcisnij return" -> "lalt"
-local function promptKey(text)
-    local t = fold(text)
+-- fold tekstu liczony tylko po jego zmianie (cache: id -> { tekst, fold }); skany co klatke / co 0.25 s
+local function foldAt(cache, id, text)
+    local c = cache[id]
+    if c then
+        if c[1] ~= text then c[1], c[2] = text, fold(text) end
+        return c[2]
+    end
+    local f = fold(text)
+    cache[id] = { text, f }
+    return f
+end
+local TDF, LBF = {}, {}                         -- textdrawy, etykiety 3D
+
+-- "aby kopac, nacisnij lalt aby przerwac, wcisnij return" -> "lalt" (t = tekst po fold)
+local function promptKey(t)
     if not t:find('kop', 1, true) then return nil end
     local rest = t:match('naci%S-nij%s+(.+)')
     if not rest then return nil end
@@ -12267,26 +12277,34 @@ local function readPos(e)
 end
 
 local function addPrompt(id, now)
-    if PR[id] or prCount() >= 10 then return end
+    if PR[id] then return end
+    if prCount() >= 10 then
+        -- pelna lista: zwalnia miejsce po najstarszym textdrawie, ktorego juz nie ma (serwer zmienil id)
+        local old
+        for _, o in pairs(PR) do
+            if o.gone and (not old or o.changedAt < old.changedAt) then old = o end
+        end
+        if not old then return end
+        PR[old.id] = nil
+    end
     local e = { id = id, live = false, changedAt = now }
     readPos(e)
     PR[id] = e
 end
 
--- jeden pelny przeglad textdrawow (co 0.7 s): komunikaty o klawiszu i napis przy skale
+-- pelny przeglad textdrawow co 0.7 s (komunikaty o klawiszu), po 384 id na klatke - bez przyciecia gry
 local function discover(now)
-    if now < nextDisc then return end
-    nextDisc = now + 0.7
-    for id = 0, TD_MAX - 1 do
+    local i0 = disc.i
+    if i0 == 0 then
+        if now < disc.at then return end
+        disc.at = now + 0.7
+    end
+    local i1 = math.min(TD_MAX, i0 + 384) - 1
+    disc.i = (i1 + 1 < TD_MAX) and i1 + 1 or 0
+    for id = i0, i1 do
         if sampTextdrawIsExists(id) then
             local ok, text = pcall(sampTextdrawGetString, id)
-            if ok and type(text) == 'string' then
-                if promptKey(text) then
-                    addPrompt(id, now)
-                elseif oreTextInfo and oreTextInfo(text) then
-                    oreTd.id = id
-                end
-            end
+            if ok and type(text) == 'string' and promptKey(foldAt(TDF, id, text)) then addPrompt(id, now) end
         end
     end
 end
@@ -12304,7 +12322,7 @@ local function scanNeighbours(now)
     for id = lo, hi do
         if not PR[id] and sampTextdrawIsExists(id) then
             local ok, t = pcall(sampTextdrawGetString, id)
-            if ok and type(t) == 'string' and promptKey(t) then addPrompt(id, now) end
+            if ok and type(t) == 'string' and promptKey(foldAt(TDF, id, t)) then addPrompt(id, now) end
         end
     end
 end
@@ -12316,11 +12334,12 @@ local function track(now)
     scanNeighbours(now)
     for id, e in pairs(PR) do
         local text
-        if sampTextdrawIsExists(id) then
+        e.gone = not sampTextdrawIsExists(id)
+        if not e.gone then
             local ok, t = pcall(sampTextdrawGetString, id)
             if ok and type(t) == 'string' then text = t end
         end
-        local k = text and promptKey(text)
+        local k = text and promptKey(foldAt(TDF, id, text))
         if k then
             if not e.live or e.text ~= text then
                 -- tekst zmienil sie zaraz po wcisnieciu w ten textdraw = to jest prawdziwy komunikat
@@ -12416,6 +12435,26 @@ local function curInterior()
     return ok and i or 0
 end
 
+-- klucz pozycji skaly; liczony raz na tabele skaly (pozycja sie nie zmienia, skaly sa budowane od nowa co skan)
+local function spotKey(s)
+    local k = s.skey
+    if not k then
+        k = string.format('%d:%d:%d', floor(s.x + 0.5), floor(s.y + 0.5), floor(s.z + 0.5))
+        s.skey = k
+    end
+    return k
+end
+
+-- kolor rudy skaly (rysowanie co klatke: oreInfo/fold tylko raz na skale)
+local function spotRgb(s)
+    local c = s.rgb
+    if not c then
+        c = oreInfo(s.name).rgb
+        s.rgb = c
+    end
+    return c
+end
+
 local ore = {
     C = { markers = true, radar = true, objects = false },
     spots = {},            -- wszystko, co widac TERAZ (etykiety + obiekty)
@@ -12427,23 +12466,33 @@ local ore = {
     sellPos = nil,         -- punkt sprzedazy mineralow (staly)
     points = {},           -- wszystkie miejsca, gdzie kiedykolwiek byla ruda { x, y, z, int, checked, bad }
     checkAt = 0,
+    ptSeen = {}, ptSeenN = 0,   -- pozycje etykiet juz porownane z points (punkty tylko przybywaja)
+    scan = nil,            -- przeglad etykiet w toku { i, list, int }
 }
 
 -- Miejsca rud zapamietywane na stale: etykiety widac tylko z bliska, wiec przed sprzedaza bot obchodzi
 -- kazde znane miejsce, ktorego nie widzial z bliska od 2 min - sprzedaje dopiero, gdy nigdzie nie ma rudy.
 local CHECK_R, CHECK_TTL = 15, 120
 
+-- co skan etykiet: tylko pozycje jeszcze nieporownane (etykiety x 400 punktow co 0.4 s to ~1 ms)
 local function orePoints(list)
+    local seen = ore.ptSeen
     for _, s in ipairs(list) do
-        local found = false
-        for _, p in ipairs(ore.points) do
-            if (p.x - s.x) ^ 2 + (p.y - s.y) ^ 2 < 6.25 and math.abs(p.z - s.z) < 3 then found = true; break end
-        end
-        if not found and #ore.points < 400 then
-            ore.points[#ore.points + 1] = { x = s.x, y = s.y, z = s.z, int = s.int or 0 }
-            ore.dirty = true
+        local k = spotKey(s)
+        if not seen[k] then
+            seen[k], ore.ptSeenN = true, ore.ptSeenN + 1
+            local found = false
+            for _, p in ipairs(ore.points) do
+                local dx, dy = p.x - s.x, p.y - s.y
+                if dx * dx + dy * dy < 6.25 and math.abs(p.z - s.z) < 3 then found = true; break end
+            end
+            if not found and #ore.points < 400 then
+                ore.points[#ore.points + 1] = { x = s.x, y = s.y, z = s.z, int = s.int or 0 }
+                ore.dirty = true
+            end
         end
     end
+    if ore.ptSeenN > 2000 then ore.ptSeen, ore.ptSeenN = {}, 0 end
 end
 
 local function markChecked(px, py, now)
@@ -12531,10 +12580,6 @@ local function oreLoad()
     if type(t.spots) == 'table' then ore.dirty = true end
 end
 
-local function spotKey(s)
-    return string.format('%d:%d:%d', floor(s.x + 0.5), floor(s.y + 0.5), floor(s.z + 0.5))
-end
-
 -- wykopane skaly: serwer zostawia etykiete, wiec chowamy je sami (az etykieta zniknie / respawn / 20 min)
 local mined = {}                         -- { x, y, z, at, seenAt }
 
@@ -12599,16 +12644,24 @@ local function labelName(text)
     return 'Ruda'
 end
 
+-- przeglad etykiet co 0.4 s, po 512 id na klatke (2048 naraz = przyciecie gry); lista podmieniana po calym
 local function scanLabels(now)
-    if now < ore.nextScan then return end
-    ore.nextScan = now + 0.4
-    if type(sampIs3dTextDefined) ~= 'function' or type(sampGet3dTextInfoById) ~= 'function' then return end
-    local list, int = {}, curInterior()
-    for i = 0, 2047 do
+    local sc = ore.scan
+    if not sc then
+        if now < ore.nextScan then return end
+        ore.nextScan = now + 0.4
+        if type(sampIs3dTextDefined) ~= 'function' or type(sampGet3dTextInfoById) ~= 'function' then return end
+        sc = { i = 0, list = {}, int = curInterior() }
+        ore.scan = sc
+    end
+    local list, int = sc.list, sc.int
+    local i0, i1 = sc.i, math.min(2047, sc.i + 511)
+    sc.i = i1 + 1                               -- przed petla: blad w porcji nie zatrzyma przegladu
+    for i = i0, i1 do
         if sampIs3dTextDefined(i) then
             local ok, text, _, x, y, z = pcall(sampGet3dTextInfoById, i)
             if ok and type(text) == 'string' and x and not (x == 0 and y == 0 and z == 0) then
-                local ft = fold(text)
+                local ft = foldAt(LBF, i, text)
                 local wear = tonumber(ft:match('zu%S-ycie:%s*(%d+)'))
                 if not wear and ft:find('punkt sprzeda', 1, true) and ft:find('minera', 1, true) then
                     local sp = ore.sellPos                   -- punkt sprzedazy stoi zawsze w tym samym miejscu
@@ -12633,17 +12686,16 @@ local function scanLabels(now)
             end
         end
     end
+    if i1 < 2047 then return end
+    ore.scan = nil
     if C.diag and #list == 0 and next(ore.seen) then ore.seen = {} end
     -- wykopane: etykieta zniknela (gracz blisko) albo minelo 20 min = skala moze byc znowu dostepna
     local okp, px, py = pcall(getCharCoordinates, PLAYER_PED)
     for i = #mined, 1, -1 do
-        local m, here = mined[i], false
-        for _, s in ipairs(list) do
-            if (s.x - m.x) ^ 2 + (s.y - m.y) ^ 2 + (s.z - m.z) ^ 2 < 4 then here = true; break end
-        end
-        local respawn = false
+        local m, here, respawn = mined[i], false, false
         for _, s in ipairs(list) do
             if (s.x - m.x) ^ 2 + (s.y - m.y) ^ 2 + (s.z - m.z) ^ 2 < 4 then
+                here = true
                 -- zuzycie zapamietane 3 s po wydobyciu; inna wartosc pozniej = skala sie odrodzila
                 if m.wear == nil then
                     if now - m.at > 3 then m.wear = s.wear end
@@ -12736,8 +12788,8 @@ local function scanObjects(now)
     rebuildSpots()
 end
 
-local function oreHidden(s)
-    return s.int ~= nil and s.int ~= curInterior()
+local function oreHidden(s, int)                -- int = curInterior() (liczone raz przed petla)
+    return s.int ~= nil and s.int ~= int
 end
 
 -- ------------------------------------------------------------ komunikaty serwera
@@ -12755,7 +12807,7 @@ local function scanMessages()
         if sampTextdrawIsExists(id) then
             local ok, text = pcall(sampTextdrawGetString, id)
             if ok and type(text) == 'string' then
-                local f = fold(text)
+                local f = foldAt(TDF, id, text)
                 if f:find('wydobycie zako', 1, true) then done = true end
                 if wrongText(f) then wrong = f:sub(1, 60) end
             end
@@ -12813,14 +12865,6 @@ local function learnPress(pressed)                          -- pressed: vk (licz
         learn.n = learn.n + 1
         if learn.n <= 8 then log(string.format('nauka: %s po %d ms', tostring(e.key), floor(dt * 1000 + 0.5))) end
     end
-end
-
-local function median(list)
-    if #list == 0 then return nil end
-    local t = {}
-    for i, v in ipairs(list) do t[i] = v end
-    table.sort(t)
-    return t[math.ceil(#t / 2)]
 end
 
 -- ------------------------------------------------------------ diagnostyka (Boty -> Gornik Bot -> Diagnostyka)
@@ -12894,15 +12938,15 @@ local function stop()
     A.miningBusy, A.minerAuto = false, false
 end
 
-local function blocked()
-    return A.menuOpen or A.pauseActive() or A.chatInputActive() or A.dialogActive() or not A.gameFocused()
+local function blocked(dlg)                     -- dlg = A.dialogActive() (juz policzone w tej klatce)
+    return A.menuOpen or A.pauseActive() or A.chatInputActive() or dlg or not A.gameFocused()
 end
 
 -- ------------------------------------------------------------ pelny automat: bieg do rud, kopanie, sprzedaz
 -- Trasa: A* po siatce 0.8 m budowanej leniwie z kolizji gry (processLineOfSight / isLineOfSightClear,
 -- budynki + obiekty SA-MP). Liczone po kawalku co klatke (budzet czasu), krawedzie w cache (kopalnia jest
 -- statyczna, kolejne trasy ida z pamieci). Zablokowany = tymczasowa blokada przed postacia + nowa trasa.
-local nmax, nmin, nsqrt, nceil = math.max, math.min, math.sqrt, math.ceil
+local nmin, nsqrt = math.min, math.sqrt
 
 local NV = A.newNav({
     tag = 'gornik',
@@ -12948,11 +12992,11 @@ local function camHeading()
 end
 
 -- spacja trzymana przez caly sprint (puszcza ja apHalt)
-local function sprintKey(on)
-    if on and not AP.keyUp then
+local function sprintKey(want)
+    if want and not AP.keyUp then
         keyEvent(0x20, false, false)
         AP.keyUp = { vk = 0x20 }
-    elseif not on and AP.keyUp then
+    elseif not want and AP.keyUp then
         keyEvent(AP.keyUp.vk, AP.keyUp.ext, true)
         AP.keyUp = nil
     end
@@ -12987,7 +13031,7 @@ local function apStuck(now, px, py)
     if now - AP.lpAt < 1.2 then return false end
     local moved = (px - AP.lp[1]) ^ 2 + (py - AP.lp[2]) ^ 2
     AP.lp, AP.lpAt = { px, py }, now
-    if moved > 0.64 then AP.moved, AP.everMoved = true, true; return false end
+    if moved > 0.64 then AP.everMoved = true; return false end
     return true
 end
 
@@ -13021,14 +13065,14 @@ end
 local function apTarget(path, state, now)
     path[#path].final = true
     AP.path, AP.wi, AP.state, AP.nav = path, 1, state, nil
-    AP.stucks, AP.lp, AP.moved, AP.at = 0, nil, false, now
+    AP.stucks, AP.lp, AP.at = 0, nil, now
 end
 
 -- reach: odleglosc od celu, przy ktorej uznajemy, ze doszlismy
 local function apGoto(state, x, y, z, goalR, rock, reach, now, px, py, pz)
     apHalt()
     AP.dest = { x = x, y = y, z = z, goalR = goalR, rock = rock, reach = reach }
-    AP.state, AP.at, AP.stucks, AP.lp, AP.moved = state, now, 0, nil, false
+    AP.state, AP.at, AP.stucks, AP.lp = state, now, 0, nil
     AP.path, AP.wi = nil, 1
     AP.nav = navStart(px, py, pz, x, y, z, goalR, rock, now)
 end
@@ -13119,9 +13163,9 @@ end
 
 local function apPick(now, px, py, pz)
     apHalt()
-    local best, bd
+    local best, bd, int = nil, nil, curInterior()
     for _, s in ipairs(ore.spots) do
-        if s.src == 'label' and not oreHidden(s) and not AP.skip[spotKey(s)] then
+        if s.src == 'label' and not oreHidden(s, int) and not AP.skip[spotKey(s)] then
             local d = (s.x - px) ^ 2 + (s.y - py) ^ 2 + ((s.z - pz) * 3) ^ 2
             if not bd or d < bd then best, bd = s, d end
         end
@@ -13164,8 +13208,9 @@ local function apWalk(now, px, py, pz)
     local selling = AP.state == 'tosell'
     local exploring = AP.state == 'explore'
     if exploring then                                     -- po drodze pojawila sie ruda: od razu po nia
+        local int = curInterior()
         for _, s in ipairs(ore.spots) do
-            if s.src == 'label' and not oreHidden(s) and not AP.skip[spotKey(s)] then
+            if s.src == 'label' and not oreHidden(s, int) and not AP.skip[spotKey(s)] then
                 apHalt()
                 AP.nav, AP.state = nil, 'pick'
                 return
@@ -13366,6 +13411,7 @@ local function mineFailed(now)
     end
     log(string.format('serwer: nie udalo sie wydobyc %s - wracam do tej rudy (%d/%d)', tostring(lm.s.name), AP.fails[k], FAIL_MAX))
     apHalt()
+    if not (AP.target and spotKey(AP.target) == k) then AP.slots, AP.slotTried = nil, {} end   -- miejsca innej skaly
     AP.nav, AP.target, AP.tries, AP.close = nil, lm.s, 0, 1.6
     local px, py, pz = getCharCoordinates(PLAYER_PED)
     if (lm.s.x - px) ^ 2 + (lm.s.y - py) ^ 2 < 9 then
@@ -13383,7 +13429,7 @@ local function step(now)
         if type(sampTextdrawIsExists) ~= 'function' then return end
         S, on = newState(now), true
         if C.auto then
-            AP = { state = 'pick', skip = {}, camOff = -90, stucks = 0, tries = 0, at = now }
+            AP = { state = 'pick', skip = {}, slotTried = {}, stucks = 0, tries = 0, at = now }
             A.minerAuto = true
             log('pelny automat: szukam rud' .. (C.autoSell and ', na koncu sprzedaz' or ''))
         end
@@ -13405,13 +13451,14 @@ local function step(now)
     if S.cool > 0 then S.cool = S.cool - 1; return end
 
     -- okno sprzedazy mineralow obsluguje automat (inne dialogi = pauza)
-    if AP and A.dialogActive() and not A.menuOpen then
+    local dlg = A.dialogActive()
+    if AP and dlg and not A.menuOpen then
         S.why = 'sprzedaz'
         local okD, errD = pcall(apDialog, now)
         if not okD then log('sprzedaz: ' .. tostring(errD)) end
         return
     end
-    if blocked() then
+    if blocked(dlg) then
         S.why, S.paused = 'pauza', true
         if AP then pcall(apHalt) end
         return
@@ -13422,7 +13469,11 @@ local function step(now)
         pcall(apHalt)
         if AP.state ~= 'wait' and AP.state ~= 'face' then
             local px, py = getCharCoordinates(PLAYER_PED)
-            AP.target = nearestLabel(px, py, 5) or AP.target
+            local t = nearestLabel(px, py, 5)
+            if t then
+                if not (AP.target and spotKey(AP.target) == spotKey(t)) then AP.slots, AP.slotTried = nil, {} end   -- inna skala
+                AP.target = t
+            end
         end
         AP.state = 'mine'
     end
@@ -13450,7 +13501,7 @@ local function step(now)
                 S.active = false
                 local failed = S.failAt ~= nil and now - S.failAt < 6
                 S.failAt = nil
-                local mined = S.presses > 0 and not failed
+                local gotOre = S.presses > 0 and not failed
                 if failed then
                     local t = AP and AP.target
                     local k = t and spotKey(t)
@@ -13469,7 +13520,7 @@ local function step(now)
                         log('serwer: nie udalo sie wydobyc mineralu - nacisnij jeszcze raz przy tej samej rudzie')
                     end
                 end
-                if mined then
+                if gotOre then
                     S.ores = S.ores + 1
                     adapt = math.max(0, adapt - 0.01)
                     log(string.format('ruda #%d (%d klawiszy, %s)', S.ores, S.presses, finished and 'komunikat' or 'przerwa'))
@@ -13479,9 +13530,9 @@ local function step(now)
                     end)
                 end
                 S.presses, S.lastKey, S.doneChat, S.plan, S.cutAt = 0, nil, false, nil, now
-                if mined and AP then
+                if gotOre and AP then
                     AP.state, AP.at, AP.target = 'pick', now, nil
-                elseif mined and C.autoOff then
+                elseif gotOre and C.autoOff then
                     return stop()
                 end
             end
@@ -13509,13 +13560,13 @@ local function step(now)
     -- Jeden losowy czas na kazdy komunikat. Nowy klawisz: liczony od chwili, gdy komunikat sie zmienil.
     -- Ten sam klawisz pod rzad (tekst sie nie zmienia): od poprzedniego wcisniecia + opoznienie serwera.
     local same = name == S.lastKey and e.id == S.pressId and e.changedAt <= S.pressAt
-    local planKey = same and ('s' .. S.pressAt) or (e.id .. ':' .. e.changedAt)
-    if not S.plan or S.plan.k ~= planKey then
+    local pid, pt = same and -1 or e.id, same and S.pressAt or e.changedAt     -- klucz planu (bez stringa co klatke)
+    if not S.plan or S.plan.id ~= pid or S.plan.t ~= pt then
         local base = same and (S.pressAt + math.max(lat, getPing(now) / 1000)) or e.changedAt
         local d = humanDelay(S.presses == 0, same)
         local at = math.max(base + d, S.pressAt + C.minMs / 1000 + adapt)
         at = math.max(at, S.startAt + 0.25 + math.random() * 0.25)     -- po wlaczeniu bota tez chwila reakcji
-        S.plan = { k = planKey, base = base, at = at }
+        S.plan = { id = pid, t = pt, base = base, at = at }
         if C.diag then diagPrompt(e, at - base, now) end
     end
     if S.paused then                                    -- po pauzie (czat, menu...) czlowiek tez potrzebuje chwili
@@ -13662,19 +13713,22 @@ local function syncOreBlips(px, py)
         if not oreBlips[k] then
             local ok, h = pcall(addBlipForCoord, s.x, s.y, s.z)
             if not ok or not h or not doesBlipExist(h) then break end
-            changeBlipDisplay(h, 2)
-            pcall(changeBlipColour, h, toInt32(oreInfo(s.name).rgb * 256 + 0xFF))
-            oreBlips[k] = h
+            oreBlips[k] = h                                   -- najpierw zapis: blad nizej nie zgubi uchwytu (wyciek blipa)
+            pcall(changeBlipDisplay, h, 2)
+            pcall(changeBlipColour, h, toInt32(spotRgb(s) * 256 + 0xFF))
         end
     end
 end
 
-local radarState = { shown = false }
+local radarState = { near = {} }                              -- near: bufor minimapy (bez alokacji co klatke)
+local hudC = { d = false, txt = 'Gornik', w = nil }           -- HUD: tekst i szerokosc liczone tylko po zmianie
+
+local function nearFirst(a, b) return a.rd < b.rd end
 
 local function drawOreRadar(px, py)
     if not ore.C.radar then return end
-    local inInt = curInterior() ~= 0
-    if not inInt and not A.menuOpen then return end          -- poza interiorem dziala zwykly radar gry
+    local int = curInterior()
+    if int == 0 and not A.menuOpen then return end          -- poza interiorem dziala zwykly radar gry
     fontOre = fontOre or renderCreateFont('Arial', 8, 5)
     local R, range = 80, 80
     local x, y = A.hudPlace('rudy', 2 * R + 6, 2 * R + 6, 0.80, 0.52)
@@ -13695,24 +13749,28 @@ local function drawOreRadar(px, py)
     end
     local rx, ry = fy, -fx                                        -- "prawo" na minimapie, gora = kierunek kamery
     local scale = R / range
-    local near = {}
+    local near, n = radarState.near, 0
     for _, s in ipairs(ore.spots) do
-        if not oreHidden(s) then
+        if not oreHidden(s, int) then
             local dx, dy = s.x - px, s.y - py
             local sx, sy = (dx * rx + dy * ry) * scale, -(dx * fx + dy * fy) * scale
             local d = math.sqrt(sx * sx + sy * sy)
             local edge = d > R - 4
             if edge then sx, sy = sx / d * (R - 4), sy / d * (R - 4) end
-            local rgb = oreInfo(s.name).rgb
-            renderDrawBox(cx + sx - 2, cy + sy - 2, 4, 4, (edge and 0x80000000 or 0xFF000000) + rgb)
-            near[#near + 1] = { s = s, sx = sx, sy = sy, d = math.sqrt(dx * dx + dy * dy), rgb = rgb }
+            renderDrawBox(cx + sx - 2, cy + sy - 2, 4, 4, (edge and 0x80000000 or 0xFF000000) + spotRgb(s))
+            n = n + 1
+            near[n] = s
+            s.rsx, s.rsy, s.rd = sx, sy, math.sqrt(dx * dx + dy * dy)
         end
     end
+    for i = #near, n + 1, -1 do near[i] = nil end
     renderDrawBox(cx - 2, cy - 2, 4, 4, 0xFFFFFFFF)               -- Ty
-    table.sort(near, function(a, b) return a.d < b.d end)
-    for i = 1, math.min(3, #near) do                              -- podpisy 3 najblizszych
-        local e = near[i]
-        renderFontDrawText(fontOre, string.format('%s %dm', e.s.name, math.floor(e.d + 0.5)), cx + e.sx + 5, cy + e.sy - 6, 0xFF000000 + e.rgb)
+    if n > 1 then table.sort(near, nearFirst) end
+    for i = 1, math.min(3, n) do                                  -- podpisy 3 najblizszych
+        local s = near[i]
+        local dm = floor(s.rd + 0.5)
+        if s.rlD ~= dm then s.rlD, s.rl = dm, string.format('%s %dm', s.name, dm) end
+        renderFontDrawText(fontOre, s.rl, cx + s.rsx + 5, cy + s.rsy - 6, 0xFF000000 + spotRgb(s))
     end
 end
 
@@ -13726,10 +13784,15 @@ local function drawOres(px, py, pz)
         if d < 600 and isPointOnScreen(s.x, s.y, mz, 1.0) then
             local sx, sy = convert3DCoordsToScreen(s.x, s.y, mz)
             if sx then
-                local rgb = oreInfo(s.name).rgb
+                local rgb = spotRgb(s)
                 local a = s.src == 'label' and 0xFF000000 or 0xA0000000
-                local label = string.format('%s  %dm', s.name, floor(d + 0.5)) .. (s.wear and ('  ' .. s.wear .. '%') or '')
-                local w = renderGetFontDrawTextLength(fontOre, label)
+                local dm = floor(d + 0.5)
+                if s.lblD ~= dm then                            -- napis i jego szerokosc tylko po zmianie odleglosci
+                    s.lblD = dm
+                    s.lbl = string.format('%s  %dm', s.name, dm) .. (s.wear and ('  ' .. s.wear .. '%') or '')
+                    s.lblW = renderGetFontDrawTextLength(fontOre, s.lbl)
+                end
+                local label, w = s.lbl, s.lblW
                 renderDrawBox(sx - 3, sy - 3, 6, 6, a + rgb)
                 renderDrawBox(sx - w / 2 - 3, sy + 5, w + 6, 14, 0x80000000)
                 renderFontDrawText(fontOre, label, sx - w / 2, sy + 6, a + rgb)
@@ -13766,9 +13829,12 @@ function M.frame(now)
         oreSave()
     end
     if not C.hud or not A.drawOk or not font or not (on or A.menuOpen) then return end
-    local txt = 'Gornik'
-    if on and S and S.lastDelay then txt = string.format('Gornik  %d ms', S.lastDelay) end
-    local w = renderGetFontDrawTextLength(font, txt)
+    local d = on and S and S.lastDelay or false
+    if d ~= hudC.d or not hudC.w then
+        hudC.d, hudC.txt = d, d and string.format('Gornik  %d ms', d) or 'Gornik'
+        hudC.w = renderGetFontDrawTextLength(font, hudC.txt)
+    end
+    local txt, w = hudC.txt, hudC.w
     local x, y = A.hudPlace('gornik', w + 14, 18, 0.47, 0.10)
     renderDrawBox(x, y, w + 14, 18, 0x90000000)
     renderDrawBox(x, y, 3, 18, not on and 0xFF666666 or (S and S.why == 'kopie' and 0xFF33FF66 or 0xFFFFD24A))
@@ -13781,7 +13847,14 @@ function M.disable()
 end
 
 function M.terminate(quit)
-    release()
+    -- przeladowanie / panic przy dzialajacym automacie: spacja sprintu zostalaby wcisnieta w Windows,
+    -- a task chodzenia prowadzilby postac dalej
+    if quit then
+        release()
+        if AP and AP.keyUp then keyEvent(AP.keyUp.vk, AP.keyUp.ext, true) end
+    else
+        pcall(stop)
+    end
     A.miningBusy = false
     if cfgDirty then pcall(save) end
     if ore.dirty then pcall(oreSave) end
@@ -13792,15 +13865,16 @@ function M.menuGroup()
     local ui = A.ui
     ui.keyButton('Klawisz', function() return C.key end, function(vk) C.key = vk; save() end,
         'Stoisz przy skale, naciskasz klawisz - bot sam wciska pokazywane klawisze (takze kolko myszy), az ruda zostanie wydobyta.')
+    -- suwaki: setter leci co klatke przeciagania - zapis na dysk przez cfgDirty (M.frame / terminate)
     ui.sliderInt('Minimum', function() return C.minMs end, function(v)
         C.minMs = v
         if C.avgMs < v then C.avgMs = v + 60 end
-        save()
+        cfgDirty = true
     end, 300, 900, '%d ms',
         'Bot nigdy nie wcisnie klawisza szybciej niz tyle od jego pojawienia sie. Ponizej ok. 500 ms serwer przerywa kopanie ("niewlasciwy klawisz").')
-    ui.sliderInt('Srednio', function() return C.avgMs end, function(v) C.avgMs = math.max(v, C.minMs); save() end, 400, 1200, '%d ms',
+    ui.sliderInt('Srednio', function() return C.avgMs end, function(v) C.avgMs = math.max(v, C.minMs); cfgDirty = true end, 400, 1200, '%d ms',
         'Typowy czas reakcji. Bot losuje wokol niego: raz troche szybciej, raz wolniej, czasem dluzsze zawahanie - ale nigdy ponizej minimum.')
-    ui.sliderInt('Rozrzut', function() return C.spreadMs end, function(v) C.spreadMs = v; save() end, 0, 150, '%d ms',
+    ui.sliderInt('Rozrzut', function() return C.spreadMs end, function(v) C.spreadMs = v; cfgDirty = true end, 0, 150, '%d ms',
         'Jak bardzo czasy sie roznia. 0 = zawsze tak samo (jak bot), 40-60 = naturalnie.')
     if #recent > 0 then
         local mn, mx, sum = 1e9, 0, 0
